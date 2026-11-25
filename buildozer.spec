@@ -5,7 +5,7 @@ package.domain = org.privatevault
 source.dir = .
 source.include_exts = py
 version = 1.0
-requirements = python3,kivy==2.3.0,pillow
+requirements = python3,kivy==2.3.0,pillow,ffpyplayer
 orientation = portrait
 fullscreen = 0
 android.permissions = READ_MEDIA_IMAGES,READ_MEDIA_VIDEO,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
