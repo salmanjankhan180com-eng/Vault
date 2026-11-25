@@ -1,48 +1,101 @@
-import os, json, hashlib, time, threading, queue, shutil, zipfile, base64, mimetypes
+import os, json, hashlib, time, threading, queue, shutil, zipfile, base64, mimetypes, subprocess
+try:
+    import ffpyplayer  # noqa: F401
+    os.environ.setdefault("KIVY_VIDEO", "ffpyplayer")
+    HAS_FFPY, FFPY_ERR = True, ""
+except Exception as _e:
+    HAS_FFPY, FFPY_ERR = False, str(_e)[:80]
 from kivy.app import App
 from kivy.cache import Cache
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.graphics import Color, RoundedRectangle, Rectangle, Ellipse, Line
+from kivy.graphics import Color, RoundedRectangle, Rectangle, Ellipse, Line, Triangle
 from kivy.metrics import dp
-from kivy.utils import get_color_from_hex as hx, escape_markup
+from kivy.utils import get_color_from_hex as hx
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.button import Button
-from kivy.uix.label import Label
+from kivy.uix.label import Label as KLabel
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image, AsyncImage
 from kivy.uix.popup import Popup
 from kivy.uix.textinput import TextInput
 from kivy.uix.behaviors import ButtonBehavior
-from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition, NoTransition
 
 try:
     from kivy.uix.video import Video
 except Exception:
     Video = None
 
-try:  # chhote thumbnails ke liye (Pydroid mein aam taur par hota hai)
+try:
     from PIL import Image as PILImage
 except Exception:
     PILImage = None
 
-BG = "#0D0D12"
-Window.clearcolor = hx(BG)
-ACCENT, CARD, RED, GREEN = "#6C4DFF", "#1E1E2A", "#E5484D", "#2FB26B"
-SOFT, MUTED, NAVBG = "#2A2A3C", "#9A9AB0", "#14141C"
+# ---------------- Theme ----------------
+RED, GREEN = "#E5484D", "#2FB26B"
+BG = ACCENT = CARD = SOFT = MUTED = NAVBG = HEAD = TXT = "#000000"
+# (pastel colour, accent colour)
+SCHEMES = [("#B5D0F8", "#1A6DE0"), ("#EBDDF1", "#8E44AD"), ("#DFEEDD", "#2E8B57"),
+           ("#F2EBE1", "#B7791F"), ("#E0F1EE", "#12998A"), ("#E0E7F1", "#4A6FA5"),
+           ("#F3DEDE", "#D6455D"), ("#EDF1E0", "#7A9A1E")]
+
+
+def mix(h1, h2, t):
+    a, b = hx(h1), hx(h2)
+    c = [a[i] * (1 - t) + b[i] * t for i in range(3)]
+    return "#%02X%02X%02X" % tuple(int(x * 255) for x in c)
+
+
+def apply_theme(mode, scheme):
+    global BG, ACCENT, CARD, SOFT, MUTED, NAVBG, HEAD, TXT
+    pastel, acc = SCHEMES[scheme if 0 <= scheme < len(SCHEMES) else 0]
+    hr = time.localtime().tm_hour
+    night = mode == "night" or (mode == "auto" and (hr >= 19 or hr < 6))
+    if night:
+        BG, CARD, SOFT, NAVBG, HEAD = "#16171B", "#272A33", "#343845", "#1E2026", "#1E2026"
+        TXT, MUTED, ACCENT = "#F2F2F7", "#9A9AB0", mix(acc, "#FFFFFF", .15)
+    else:
+        BG, CARD, SOFT = "#F8FCFF", mix(pastel, "#FFFFFF", .45), mix(pastel, "#000000", .08)
+        NAVBG, HEAD, TXT, MUTED, ACCENT = pastel, pastel, "#101114", "#6A707C", acc
+    Window.clearcolor = hx(BG)
+
+
+# ---------------- Constants ----------------
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
 VID_EXTS = (".mp4", ".mkv", ".3gp", ".mov", ".avi", ".webm")
 ALL_EXTS = IMG_EXTS + VID_EXTS
 ROOT = "/storage/emulated/0"
 RESTORE_DIR = "/storage/emulated/0/Pictures/VaultRestored"
+PLAY_DIR = "/storage/emulated/0/.vault_play"
 AUTOLOCK_OPTS = [("Off", 0), ("15 sec", 15), ("30 sec", 30), ("1 min", 60), ("5 min", 300)]
 MAGIC = b"PVT1"
 CHUNK = 1 << 18
+MIN_PIN, MAX_PIN = 4, 12
+DEFAULT_FOLDERS = ("Pictures", "Downloads", "Videos")
+TRASH_DAYS = 30
+# key, label, columns, cell height (dp), description
+FOLDER_STYLES = [
+    ("default", "Default", 2, 170, "Big folder icons, 2 per row"),
+    ("standard", "Standard", 3, 135, "Small folder icons, 3 per row"),
+    ("large", "Large Cover", 2, 190, "Cover photo with name below, 2 per row"),
+    ("mini", "Mini Cover", 2, 64, "Small cover on the left, 2 per row"),
+    ("list", "List View", 1, 92, "One folder per row with cover"),
+    ("grid", "Grid View", 3, 150, "Cover photo grid, 3 per row"),
+    ("xlarge", "Extra Large Cover", 1, 230, "One big cover per row"),
+]
+LANGS = [("en", "English"), ("hi", "Hindi"), ("mr", "Marathi"), ("bn", "Bengali"),
+         ("cs", "Cestina"), ("it", "Italiano"), ("es", "Espanol"), ("pt", "Portugues"),
+         ("de", "Deutsch"), ("eu", "Euskara"), ("fr", "Francais"), ("ar", "Arabic"),
+         ("fa", "Persian"), ("ja", "Japanese"), ("kn", "Kannada"), ("ko", "Korean"),
+         ("ml", "Malayalam"), ("pl", "Polski"), ("ru", "Russian"), ("ta", "Tamil"),
+         ("tr", "Turkce"), ("uk", "Ukrainian")]
+AVAILABLE_LANGS = {"en"}
+
 
 def ask_android_permissions():
-    """APK mein photos/videos ki permission maangta hai (Pydroid mein ignore)."""
     try:
         from android.permissions import request_permissions
         request_permissions([
@@ -62,31 +115,33 @@ MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
             "video/x-msvideo": ".avi", "video/webm": ".webm"}
 
 
-def open_gallery_picker(on_result):
-    """Phone ka apna Gallery/Photo picker kholta hai (storage permission ki zarurat nahi).
-    Chalu ho gaya to True, nahi to False (tab purana folder browser chalega).
-    on_result(list_of_uri_strings) jab user select karke wapas aaye."""
+def open_gallery_picker(on_result, kind="photo"):
+    """Opens the phone's GALLERY (not the file manager).
+    Android 13+: system Photo picker (gallery style, multi-select).
+    Older Android: ACTION_PICK on MediaStore, which opens the Gallery / Photos app.
+    Returns True if it started, False otherwise (then the in-app browser is used)."""
     try:
         from android import activity
         from jnius import autoclass
         Intent = autoclass("android.content.Intent")
         Build = autoclass("android.os.Build$VERSION")
+        MediaStore = autoclass("android.provider.MediaStore")
         act = autoclass("org.kivy.android.PythonActivity").mActivity
+        mime = "video/*" if kind == "video" else "image/*"
 
         if Build.SDK_INT >= 33:
-            MediaStore = autoclass("android.provider.MediaStore")
             it = Intent("android.provider.action.PICK_IMAGES")
+            it.setType(mime)
             it.putExtra("android.provider.extra.PICK_IMAGES_MAX",
                         int(MediaStore.getPickImagesMaxLimit()))
         else:
-            it = Intent(Intent.ACTION_GET_CONTENT)
-            it.setType("*/*")
-            it.addCategory(Intent.CATEGORY_OPENABLE)
+            if kind == "video":
+                coll = autoclass("android.provider.MediaStore$Video$Media").EXTERNAL_CONTENT_URI
+            else:
+                coll = autoclass("android.provider.MediaStore$Images$Media").EXTERNAL_CONTENT_URI
+            it = Intent(Intent.ACTION_PICK, coll)
+            it.setType(mime)
             it.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
-            try:
-                it.putExtra(Intent.EXTRA_MIME_TYPES, ["image/*", "video/*"])
-            except Exception:
-                it.setType("image/*")
 
         def cb(req, res, data):
             if req != PICK_CODE:
@@ -97,7 +152,7 @@ def open_gallery_picker(on_result):
                 pass
             uris = []
             try:
-                if res == -1 and data is not None:  # RESULT_OK
+                if res == -1 and data is not None:
                     clip = data.getClipData()
                     if clip is not None:
                         for i in range(clip.getItemCount()):
@@ -116,7 +171,6 @@ def open_gallery_picker(on_result):
 
 
 def copy_uri_to_file(uri_str, dst_dir, i):
-    """Gallery wali file ko app ke temp folder mein copy karta hai, path return karta hai."""
     from jnius import autoclass
     Uri = autoclass("android.net.Uri")
     act = autoclass("org.kivy.android.PythonActivity").mActivity
@@ -141,8 +195,6 @@ BACKUP_CODE, OPEN_CODE = 7702, 7703
 
 
 def android_document(action, code, on_result, filename=None):
-    """Android ka file-picker kholta hai. action: 'create' (save karna) ya 'open' (file chunna).
-    on_result(uri_string ya None). Chalu ho gaya to True, warna False."""
     try:
         from android import activity
         from jnius import autoclass
@@ -180,7 +232,6 @@ def android_document(action, code, on_result, filename=None):
 
 
 def copy_path_to_uri(src, uri_str):
-    """App ki file ko user ke chune hue Android document (Drive/Downloads) mein likhta hai."""
     from jnius import autoclass
     Uri = autoclass("android.net.Uri")
     cr = autoclass("org.kivy.android.PythonActivity").mActivity.getContentResolver()
@@ -191,7 +242,6 @@ def copy_path_to_uri(src, uri_str):
 
 
 def copy_uri_to_path(uri_str, dst):
-    """User ke chune hue Android document ko app ke temp path par copy karta hai."""
     from jnius import autoclass
     Uri = autoclass("android.net.Uri")
     cr = autoclass("org.kivy.android.PythonActivity").mActivity.getContentResolver()
@@ -206,8 +256,8 @@ def copy_uri_to_path(uri_str, dst):
 
 
 def export_to_gallery(src, fname):
-    """Decrypted file ko Gallery mein wapas rakhta hai. Pehle Android MediaStore (Android 10+),
-    na chale to seedha folder (Pictures/VaultRestored). Jagah ka naam return karta hai."""
+    """Puts a decrypted file back in the phone Gallery (MediaStore on Android 10+,
+    otherwise Pictures/VaultRestored)."""
     try:
         from jnius import autoclass
         Build = autoclass("android.os.Build$VERSION")
@@ -225,7 +275,7 @@ def export_to_gallery(src, fname):
                              else "android.provider.MediaStore$Images$Media").EXTERNAL_CONTENT_URI
             uri = cr.insert(coll, vals)
             if uri is None:
-                raise Exception("MediaStore insert nahi hua")
+                raise Exception("MediaStore insert failed")
             pfd = cr.openFileDescriptor(uri, "w")
             fd = pfd.detachFd()
             with os.fdopen(fd, "wb") as fo, open(src, "rb") as fi:
@@ -252,6 +302,61 @@ def is_video(name):
     return base_name(name).lower().endswith(VID_EXTS)
 
 
+def valid_pin(p):
+    return p.isdigit() and MIN_PIN <= len(p) <= MAX_PIN
+
+
+# ---------------- External video player ----------------
+def clear_play_dir():
+    """Deletes temporary decrypted videos that were opened in the phone's video player."""
+    try:
+        for f in os.listdir(PLAY_DIR):
+            if f != ".nomedia":
+                _rm(os.path.join(PLAY_DIR, f))
+    except Exception:
+        pass
+
+
+def video_provider_ok():
+    """True only when a real video engine (ffpyplayer) is installed."""
+    return HAS_FFPY and Video is not None
+
+
+def play_external(path):
+    """Opens a video file in the phone's own video player. Returns (ok, error_text)."""
+    mime = mimetypes.guess_type(path)[0] or "video/*"
+    uri = "file://" + path
+    # 1) Android APK: direct intent
+    try:
+        from jnius import autoclass
+        Intent = autoclass("android.content.Intent")
+        Uri = autoclass("android.net.Uri")
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        StrictMode = autoclass("android.os.StrictMode")
+        VmPolicy = autoclass("android.os.StrictMode$VmPolicy$Builder")
+        StrictMode.setVmPolicy(VmPolicy().build())
+        it = Intent(Intent.ACTION_VIEW)
+        it.setDataAndType(Uri.parse(uri), mime)
+        act.startActivity(it)
+        return True, ""
+    except Exception:
+        pass
+    # 2) Pydroid: Android 'am' command
+    last = ""
+    for exe in ("am", "/system/bin/am"):
+        try:
+            r = subprocess.run([exe, "start", "-a", "android.intent.action.VIEW",
+                                "-d", uri, "-t", mime],
+                               capture_output=True, text=True, timeout=10)
+            out = (r.stdout or "") + (r.stderr or "")
+            if r.returncode == 0 and "Error" not in out and "Exception" not in out:
+                return True, ""
+            last = out.strip()[:120] or "player did not start"
+        except Exception as e:
+            last = str(e)
+    return False, last
+
+
 # ---------------- Crypto helpers ----------------
 def _ks(key, nonce, idx, n):
     return hashlib.shake_256(key + nonce + idx.to_bytes(8, "big")).digest(n)
@@ -275,17 +380,47 @@ def _rm(path):
         pass
 
 
+def make_video_thumb(src, tp):
+    """Takes one frame of a video and saves it as a small JPEG. Returns path or None."""
+    try:
+        from jnius import autoclass
+        MMR = autoclass("android.media.MediaMetadataRetriever")
+        Bitmap = autoclass("android.graphics.Bitmap")
+        Fmt = autoclass("android.graphics.Bitmap$CompressFormat")
+        FOS = autoclass("java.io.FileOutputStream")
+        r = MMR()
+        r.setDataSource(src)
+        bmp = r.getFrameAtTime(1000000)
+        if bmp is None:
+            bmp = r.getFrameAtTime()
+        r.release()
+        if bmp is None:
+            return None
+        w, h = bmp.getWidth(), bmp.getHeight()
+        sc = 360.0 / max(w, h)
+        bmp = Bitmap.createScaledBitmap(bmp, max(1, int(w * sc)), max(1, int(h * sc)), True)
+        fos = FOS(tp)
+        bmp.compress(Fmt.JPEG, 80, fos)
+        fos.close()
+        return tp
+    except Exception:
+        return None
+
+
 # ---------------- Storage ----------------
 class Store:
     def __init__(self, base, cache):
         self.media = os.path.join(base, "media")
+        self.trash = os.path.join(base, "trash")
         self.cache = cache
-        os.makedirs(self.media, exist_ok=True)
-        os.makedirs(self.cache, exist_ok=True)
+        for d in (self.media, self.trash, self.cache):
+            os.makedirs(d, exist_ok=True)
         self.key = None
         self.clear_cache()
         self.cfg_path = os.path.join(base, "config.json")
-        self.cfg = {"pin": None, "albums": {}, "autolock": 60, "fails": 0, "lock_until": 0}
+        self.cfg = {"pin": None, "albums": {}, "album_kind": {}, "trash": {},
+                    "autolock": 60, "fails": 0, "lock_until": 0,
+                    "theme": "light", "scheme": 0, "folder_style": "default", "lang": "en"}
         try:
             with open(self.cfg_path) as f:
                 self.cfg.update(json.load(f))
@@ -349,7 +484,6 @@ class Store:
 
     # ----- recovery key / backup / import -----
     def recovery_key(self):
-        """Master key ko padhne layak code mein deta hai (vault khula hona chahiye)."""
         if self.key is None:
             raise Exception("Vault locked")
         s = base64.b32encode(self.key).decode().rstrip("=")
@@ -371,7 +505,6 @@ class Store:
             hashlib.sha256(master).hexdigest() == cfg["check"]
 
     def recover_with_key(self, master, newpin):
-        """PIN bhool gaye: Recovery Key se vault kholkar naya PIN set karta hai."""
         if not self.has_keys() or not self.master_ok(master):
             return False
         self.rewrap(master, newpin)
@@ -381,11 +514,10 @@ class Store:
         return True
 
     def make_backup(self, dest, cb=None):
-        """Encrypted files + albums ki ek zip banata hai. PIN wali key zip mein NAHI jaati,
-        isliye zip sirf Recovery Key se hi khul sakti hai."""
         names = [f for f in os.listdir(self.media) if f.endswith(".vault")]
         meta = {"v": 1, "check": self.cfg.get("check"),
                 "albums": self.cfg.get("albums", {}),
+                "album_kind": self.cfg.get("album_kind", {}),
                 "autolock": self.cfg.get("autolock", 60)}
         tmp = dest + ".part"
         try:
@@ -411,16 +543,15 @@ class Store:
             if not isinstance(meta, dict) or "check" not in meta:
                 raise ValueError("no check")
         except Exception:
-            raise Exception("Ye Vault ka backup nahi hai")
+            raise Exception("This is not a Vault backup")
         return meta, names
 
     def import_backup(self, zpath, master, newpin, cb=None):
-        """Backup zip ko khali vault mein wapas laata hai, naye PIN ke saath."""
         meta, names = self.read_backup(zpath)
         if not self.master_ok(master, meta):
-            raise Exception("Recovery Key galat hai")
+            raise Exception("Wrong Recovery Key")
         if self.media_list() or self.plain_files():
-            raise Exception("Import sirf khali vault mein ho sakta hai")
+            raise Exception("Import works only on an empty vault")
         copied = []
         try:
             with zipfile.ZipFile(zpath) as z:
@@ -447,6 +578,7 @@ class Store:
         albums = meta.get("albums", {})
         self.cfg["albums"] = {a: [x for x in lst if x in have]
                               for a, lst in albums.items() if isinstance(lst, list)}
+        self.cfg["album_kind"] = meta.get("album_kind", {})
         self.cfg["autolock"] = meta.get("autolock", 60)
         self.cfg["fails"], self.cfg["lock_until"] = 0, 0
         self.setup_keys(newpin, master)
@@ -482,7 +614,7 @@ class Store:
             with open(src, "rb") as fi, open(dst, "wb") as fo:
                 head = fi.read(20)
                 if head[:4] != MAGIC:
-                    raise Exception("File format galat")
+                    raise Exception("Bad file format")
                 nonce = head[4:]
                 idx = 0
                 while True:
@@ -494,6 +626,10 @@ class Store:
         except Exception:
             _rm(dst)
             raise
+
+    def find(self, name):
+        p = os.path.join(self.media, name)
+        return p if os.path.exists(p) else os.path.join(self.trash, name)
 
     def cache_path(self, name):
         return os.path.join(self.cache, base_name(name))
@@ -508,12 +644,11 @@ class Store:
         if os.path.exists(path) and os.path.getsize(path) > 0:
             return path
         tmp = path + f".{threading.get_ident()}.tmp"
-        self.decrypt_file(os.path.join(self.media, name), tmp, key)
+        self.decrypt_file(self.find(name), tmp, key)
         os.replace(tmp, path)
         return path
 
     def thumb_cached(self, name, key):
-        """Chhota JPEG thumbnail banata hai (PIL ho to), warna poori decrypted file."""
         if key is None:
             raise Exception("Vault locked")
         tp = self.thumb_path(name)
@@ -525,8 +660,14 @@ class Store:
             src = full
         else:
             tmp = full + f".{threading.get_ident()}.tmp"
-            self.decrypt_file(os.path.join(self.media, name), tmp, key)
+            self.decrypt_file(self.find(name), tmp, key)
             src = tmp
+        if is_video(name):
+            vt = make_video_thumb(src, tp)
+            if tmp:
+                os.replace(tmp, full)
+                tmp = None
+            return vt or None
         result = None
         if PILImage is not None:
             part = tp + f".{threading.get_ident()}.part"
@@ -557,7 +698,7 @@ class Store:
     def restore_file(self, name, key):
         fname = base_name(name)
         tmp = os.path.join(self.cache, f"restore_{threading.get_ident()}_{fname}")
-        self.decrypt_file(os.path.join(self.media, name), tmp, key)
+        self.decrypt_file(self.find(name), tmp, key)
         try:
             return export_to_gallery(tmp, fname)
         finally:
@@ -607,34 +748,85 @@ class Store:
         return done
 
     def add_one(self, path, i, move=False, key=None):
-        """Success par None, fail par error text return karta hai."""
+        """Returns (vault_name, None) on success or (None, error_text)."""
         try:
             ext = os.path.splitext(path)[1].lower()
             name = f"{int(time.time() * 1000)}_{i}{ext}.vault"
             self.encrypt_file(path, os.path.join(self.media, name), key)
             if move:
                 _rm(path)
-            return None
+            return name, None
         except Exception as e:
-            return str(e)
+            return None, str(e)
 
-    def delete(self, name):
-        for p in (os.path.join(self.media, name), self.cache_path(name), self.thumb_path(name)):
-            _rm(p)
+    # ----- delete / recycle bin -----
+    def _drop_cache(self, name):
+        _rm(self.cache_path(name))
+        _rm(self.thumb_path(name))
+
+    def _unlink_albums(self, name):
         for a in self.cfg["albums"].values():
             if name in a:
                 a.remove(name)
+
+    def delete(self, name):
+        """Permanent delete (from vault or recycle bin)."""
+        _rm(os.path.join(self.media, name))
+        _rm(os.path.join(self.trash, name))
+        self._drop_cache(name)
+        self._unlink_albums(name)
+        self.cfg["trash"].pop(name, None)
         self.save()
 
-    def create_album(self, name):
-        if name and name not in self.cfg["albums"]:
+    def trash_move(self, name):
+        src, dst = os.path.join(self.media, name), os.path.join(self.trash, name)
+        al = [a for a, lst in self.cfg["albums"].items() if name in lst]
+        shutil.move(src, dst)
+        self._drop_cache(name)
+        self._unlink_albums(name)
+        self.cfg["trash"][name] = {"t": time.time(), "albums": al}
+        self.save()
+
+    def trash_list(self):
+        tr = self.cfg["trash"]
+        names = [n for n in tr if os.path.exists(os.path.join(self.trash, n))]
+        return sorted(names, key=lambda n: tr[n].get("t", 0), reverse=True)
+
+    def trash_restore(self, name):
+        shutil.move(os.path.join(self.trash, name), os.path.join(self.media, name))
+        rec = self.cfg["trash"].pop(name, {})
+        for a in rec.get("albums", []):
+            if a in self.cfg["albums"]:
+                self.cfg["albums"][a].append(name)
+        self.save()
+
+    def purge_trash(self):
+        limit = time.time() - TRASH_DAYS * 86400
+        for n, rec in list(self.cfg["trash"].items()):
+            if rec.get("t", 0) < limit:
+                self.delete(n)
+
+    # ----- folders -----
+    def folders_for(self, kind):
+        base = ["Pictures", "Downloads"] if kind == "photo" else ["Downloads", "Videos"]
+        ak = self.cfg["album_kind"]
+        extra = [a for a in self.cfg["albums"]
+                 if a not in DEFAULT_FOLDERS and ak.get(a, kind) == kind]
+        return base + extra
+
+    def create_album(self, name, kind="photo"):
+        if name and name not in self.cfg["albums"] and name not in DEFAULT_FOLDERS:
             self.cfg["albums"][name] = []
+            self.cfg["album_kind"][name] = kind
             self.save()
             return True
         return False
 
     def delete_album(self, name):
+        if name in DEFAULT_FOLDERS:
+            return
         self.cfg["albums"].pop(name, None)
+        self.cfg["album_kind"].pop(name, None)
         self.save()
 
     def add_to_album(self, album, name):
@@ -643,23 +835,41 @@ class Store:
             lst.append(name)
         self.save()
 
+    def add_many_to_album(self, album, names):
+        lst = self.cfg["albums"].setdefault(album, [])
+        for n in names:
+            if n not in lst:
+                lst.append(n)
+        self.save()
 
-# ---------------- Premium UI widgets ----------------
+    def move_to_album(self, name, src, dst):
+        if src and name in self.cfg["albums"].get(src, []):
+            self.cfg["albums"][src].remove(name)
+        self.add_to_album(dst, name)
+
+
+# ---------------- UI widgets ----------------
+class Label(KLabel):
+    def __init__(self, **kw):
+        kw.setdefault("color", hx(TXT))
+        super().__init__(**kw)
+
+
 class RBtn(Button):
-    """Rounded, flat, modern button."""
+    """Rounded flat button. Text colour adapts to the background."""
 
-    def __init__(self, bg=CARD, radius=12, **kw):
+    def __init__(self, bg=None, radius=12, **kw):
         kw.setdefault("bold", True)
         super().__init__(**kw)
         self.background_normal = ""
         self.background_down = ""
         self.background_color = (0, 0, 0, 0)
-        self.color = (1, 1, 1, 1)
-        self._rgba = hx(bg)
+        self._rgba = hx(bg or CARD)
         with self.canvas.before:
             self._col = Color(*self._rgba)
             self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(radius)])
         self.bind(pos=self._sync, size=self._sync, state=self._paint)
+        self._paint()
 
     def _sync(self, *a):
         self._rect.pos = self.pos
@@ -669,15 +879,47 @@ class RBtn(Button):
         r, g, b, al = self._rgba
         k = .72 if self.state == "down" else 1
         self._col.rgba = (r * k, g * k, b * k, al)
+        self.color = (1, 1, 1, 1) if (.299 * r + .587 * g + .114 * b) < .62 else hx("#101114")
 
     def set_bg(self, color):
         self._rgba = hx(color)
         self._paint()
 
 
-class Cover(AsyncImage):
-    """Image jiske peeche rounded placeholder card hota hai."""
+class Card(BoxLayout):
+    def __init__(self, bg=None, radius=10, **kw):
+        super().__init__(**kw)
+        with self.canvas.before:
+            Color(*hx(bg or CARD))
+            self._r = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(radius)])
+        self.bind(pos=self._s, size=self._s)
 
+    def _s(self, *a):
+        self._r.pos = self.pos
+        self._r.size = self.size
+
+
+class FolderIcon(Widget):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.bind(pos=self.draw, size=self.draw)
+
+    def draw(self, *a):
+        self.canvas.clear()
+        s = min(self.width, self.height) * .85
+        if s <= 0:
+            return
+        x, y = self.center_x - s / 2, self.center_y - s * .4
+        with self.canvas:
+            Color(.96, .62, .05, 1)
+            RoundedRectangle(pos=(x + s * .02, y + s * .2), size=(s * .9, s * .7), radius=[dp(8)])
+            Color(1, 1, 1, .9)
+            RoundedRectangle(pos=(x + s * .1, y + s * .3), size=(s * .76, s * .55), radius=[dp(4)])
+            Color(.99, .78, .3, 1)
+            RoundedRectangle(pos=(x, y), size=(s, s * .68), radius=[dp(10)])
+
+
+class Cover(AsyncImage):
     def __init__(self, **kw):
         super().__init__(**kw)
         if hasattr(Image, "fit_mode"):
@@ -700,22 +942,97 @@ class Cover(AsyncImage):
 
 
 class Thumb(ButtonBehavior, Cover):
-    pass
+    """Picture tile. Shows a tick when selected and a play badge for videos."""
+    sel = False
+    vid = False
+
+    def set_sel(self, on):
+        self.sel = on
+        self._redraw()
+
+    def set_vid(self, on):
+        self.vid = on
+        self._redraw()
+
+    def _redraw(self):
+        self.canvas.after.clear()
+        with self.canvas.after:
+            if self.sel:
+                Color(0, 0, 0, .45)
+                RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(10)])
+                Color(*hx(ACCENT))
+                Ellipse(pos=(self.right - dp(30), self.top - dp(30)),
+                        size=(dp(22), dp(22)))
+            if self.vid:
+                s = min(self.width, self.height) * .3
+                cx, cy = self.center_x, self.center_y
+                Color(0, 0, 0, .5)
+                Ellipse(pos=(cx - s * .75, cy - s * .75), size=(s * 1.5, s * 1.5))
+                Color(1, 1, 1, .95)
+                Triangle(points=[cx - s * .25, cy - s * .4,
+                                 cx - s * .25, cy + s * .4,
+                                 cx + s * .45, cy])
+
+    def _sync(self, *a):
+        super()._sync(*a)
+        if self.sel or self.vid:
+            self._redraw()
 
 
-class AlbumCard(ButtonBehavior, BoxLayout):
-    def __init__(self, title, count, **kw):
-        super().__init__(orientation="vertical", spacing=dp(4), **kw)
-        self.cover = Cover()
-        self.add_widget(self.cover)
-        name = Label(text=title, bold=True, font_size=dp(15), size_hint_y=None,
-                     height=dp(22), halign="left", shorten=True)
-        name.bind(size=lambda w, s: setattr(w, "text_size", s))
-        cnt = Label(text=f"{count} items", font_size=dp(12), color=hx(MUTED),
-                    size_hint_y=None, height=dp(20), halign="left")
-        cnt.bind(size=lambda w, s: setattr(w, "text_size", s))
-        self.add_widget(name)
-        self.add_widget(cnt)
+def lab(text, size=14, bold=False, color=None, halign="left", h=None):
+    l = Label(text=text, font_size=dp(size), bold=bold, halign=halign, valign="middle",
+              shorten=True, color=hx(color or TXT))
+    l.bind(size=lambda w, s: setattr(w, "text_size", s))
+    if h:
+        l.size_hint_y, l.height = None, h
+    return l
+
+
+class FolderCell(ButtonBehavior, BoxLayout):
+    """One folder, drawn according to the chosen Folder Style."""
+
+    def __init__(self, style, title, count, has_cover, **kw):
+        super().__init__(**kw)
+        self.cover = None
+        txt = f"{count} items"
+        if style in ("default", "standard"):
+            self.orientation = "vertical"
+            self.add_widget(FolderIcon())
+            self.add_widget(lab(title, 15, True, halign="center", h=dp(22)))
+            self.add_widget(lab(txt, 12, color=MUTED, halign="center", h=dp(18)))
+        elif style in ("large", "grid", "xlarge"):
+            self.orientation = "vertical"
+            if has_cover:
+                self.cover = Cover()
+                self.add_widget(self.cover)
+            else:
+                self.add_widget(FolderIcon())
+            strip = Card(orientation="vertical", size_hint_y=None, height=dp(46),
+                         padding=(dp(8), dp(2)))
+            strip.add_widget(lab(title, 15, True))
+            strip.add_widget(lab(txt, 12, color=MUTED))
+            self.add_widget(strip)
+        else:  # mini / list
+            self.orientation = "horizontal"
+            with self.canvas.before:
+                Color(*hx(CARD))
+                self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(10)])
+            self.bind(pos=self._bgs, size=self._bgs)
+            w = dp(64) if style == "mini" else dp(92)
+            if has_cover:
+                self.cover = Cover(size_hint_x=None, width=w)
+                self.add_widget(self.cover)
+            else:
+                ic = FolderIcon(size_hint_x=None, width=w)
+                self.add_widget(ic)
+            right = BoxLayout(orientation="vertical", padding=(dp(10), dp(4)))
+            right.add_widget(lab(title, 15, True))
+            right.add_widget(lab(txt, 12, color=MUTED))
+            self.add_widget(right)
+
+    def _bgs(self, *a):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
 
 
 class PinDots(Widget):
@@ -730,22 +1047,18 @@ class PinDots(Widget):
 
     def draw(self, *a):
         self.canvas.clear()
-        d, gap = dp(16), dp(18)
-        x0 = self.center_x - (4 * d + 3 * gap) / 2
-        y = self.center_y - d / 2
+        d, gap = dp(14), dp(10)
         with self.canvas:
             Color(*hx(ACCENT))
-            for i in range(4):
-                x = x0 + i * (d + gap)
-                if i < self.n:
-                    Ellipse(pos=(x, y), size=(d, d))
-                else:
-                    Line(circle=(x + d / 2, y + d / 2, d / 2), width=dp(1.5))
+            if self.n:
+                x0 = self.center_x - (self.n * d + (self.n - 1) * gap) / 2
+                for i in range(self.n):
+                    Ellipse(pos=(x0 + i * (d + gap), self.center_y - d / 2), size=(d, d))
+            Line(points=[self.center_x - dp(130), self.y + dp(4),
+                         self.center_x + dp(130), self.y + dp(4)], width=dp(1.2))
 
 
 class SwipeStage(BoxLayout):
-    """Left/right swipe pakadta hai (viewer mein next/previous ke liye)."""
-
     def __init__(self, swipe_cb, **kw):
         super().__init__(**kw)
         self.swipe_cb = swipe_cb
@@ -767,8 +1080,8 @@ class SwipeStage(BoxLayout):
 
 
 # ---------------- UI helpers ----------------
-def btn(text, cb, color=CARD, **kw):
-    b = RBtn(text=text, bg=color, **kw)
+def btn(text, cb, color=None, **kw):
+    b = RBtn(text=text, bg=color or CARD, **kw)
     b.bind(on_release=lambda *a: cb())
     return b
 
@@ -779,36 +1092,28 @@ def title_label(text, size=24):
     return lbl
 
 
+def paint_bg(widget, color):
+    with widget.canvas.before:
+        Color(*hx(color))
+        rect = Rectangle(pos=widget.pos, size=widget.size)
+    widget.bind(pos=lambda w, v: setattr(rect, "pos", v),
+                size=lambda w, v: setattr(rect, "size", v))
+
+
 def header(title_widget, buttons, h=56):
     bar = BoxLayout(size_hint_y=None, height=dp(h), spacing=dp(6), padding=(dp(10), dp(6)))
+    paint_bg(bar, HEAD)
     bar.add_widget(title_widget)
     for b in buttons:
         bar.add_widget(b)
     return bar
 
 
-def nav_bar(active):
-    app = App.get_running_app()
-    bar = BoxLayout(size_hint_y=None, height=dp(62), padding=(dp(8), dp(8)), spacing=dp(6))
-    with bar.canvas.before:
-        Color(*hx(NAVBG))
-        rect = Rectangle(pos=bar.pos, size=bar.size)
-    bar.bind(pos=lambda w, v: setattr(rect, "pos", v),
-             size=lambda w, v: setattr(rect, "size", v))
-    tabs = [("Gallery", "gallery", app.show_gallery),
-            ("Albums", "albums", lambda: app.go("albums")),
-            ("Import", "import", lambda: app.go("import")),
-            ("Settings", "settings", lambda: app.go("settings"))]
-    for label, key, cb in tabs:
-        bar.add_widget(btn(label, cb, ACCENT if key == active else NAVBG,
-                           font_size=dp(13), radius=14))
-    return bar
-
-
 def popup(title, content, size_hint, auto_dismiss=True):
     return Popup(title=title, content=content, size_hint=size_hint,
                  auto_dismiss=auto_dismiss, background="",
-                 background_color=hx(CARD), separator_color=hx(ACCENT))
+                 background_color=hx(CARD), separator_color=hx(ACCENT),
+                 title_color=hx(TXT))
 
 
 def info(title, text, h=.3):
@@ -819,7 +1124,7 @@ def info(title, text, h=.3):
     return pop
 
 
-def ask(title, text, yes_cb):
+def ask(title, text, yes_cb, yes_text="Yes"):
     box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
     lbl = Label(text=text, halign="center")
     lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
@@ -827,112 +1132,153 @@ def ask(title, text, yes_cb):
     row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(48))
     pop = popup(title, box, (.85, .4))
     row.add_widget(btn("Cancel", pop.dismiss, SOFT))
-    row.add_widget(btn("Yes", lambda: (pop.dismiss(), yes_cb()), RED))
+    row.add_widget(btn(yes_text, lambda: (pop.dismiss(), yes_cb()), RED))
     box.add_widget(row)
     pop.open()
 
 
-def new_album_popup(after):
+def delete_dialog(count, on_confirm):
+    """Delete popup with 'Move to Recycle Bin' option. on_confirm(permanent: bool)."""
+    box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+    lbl = Label(text=f"Are you sure want to delete {count} file(s)?", halign="center")
+    lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+    box.add_widget(lbl)
+    state = {"bin": True}
+    chk = RBtn(text="[X]  Move to Recycle Bin", bg=SOFT, size_hint_y=None, height=dp(44))
+    box.add_widget(chk)
+    pop = popup("Delete", box, (.88, .46))
+    ok = btn("Delete", lambda: (pop.dismiss(), on_confirm(not state["bin"])), RED)
+
+    def tog(*a):
+        state["bin"] = not state["bin"]
+        chk.text = ("[X]  " if state["bin"] else "[  ]  ") + "Move to Recycle Bin"
+        ok.text = "Delete" if state["bin"] else "Delete Permanently"
+    chk.bind(on_release=tog)
+    row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(48))
+    row.add_widget(btn("Cancel", pop.dismiss, SOFT))
+    row.add_widget(ok)
+    box.add_widget(row)
+    pop.open()
+
+
+def new_album_popup(after, kind="photo"):
     app = App.get_running_app()
     box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
-    ti = TextInput(hint_text="Album name", multiline=False, size_hint_y=None, height=dp(46))
+    ti = TextInput(hint_text="Folder name", multiline=False, size_hint_y=None, height=dp(46))
     box.add_widget(ti)
-    pop = popup("New Album", box, (.85, .32))
+    pop = popup("New Folder", box, (.85, .32))
 
     def ok():
         n = ti.text.strip()
-        if n and app.store.create_album(n):
+        if n and app.store.create_album(n, kind):
             pop.dismiss()
             after(n)
         else:
             ti.text = ""
-            ti.hint_text = "Naam khali ya already hai"
+            ti.hint_text = "Name is empty or already exists"
     box.add_widget(btn("Create", ok, ACCENT, size_hint_y=None, height=dp(46)))
     pop.open()
 
 
+def folder_picker(title, folders, on_pick):
+    box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+    pop = popup(title, box, (.85, .6))
+    for a in folders:
+        box.add_widget(btn(a, lambda a=a: (pop.dismiss(), on_pick(a))))
+    box.add_widget(btn("Cancel", pop.dismiss, SOFT))
+    pop.open()
+
+
 def recovery_popup(after):
-    """PIN bhool gaye: Recovery Key + naya PIN."""
     app = App.get_running_app()
     st = app.store
     box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-    k = TextInput(hint_text="Recovery Key paste karein", multiline=False,
+    k = TextInput(hint_text="Paste Recovery Key", multiline=False,
                   size_hint_y=None, height=dp(46))
-    p = TextInput(hint_text="Naya 4-digit PIN", multiline=False, input_filter="int",
+    p = TextInput(hint_text="New PIN (4-12 digits)", multiline=False, input_filter="int",
                   password=True, size_hint_y=None, height=dp(46))
     msg = Label(color=hx("#FF6B6B"), size_hint_y=None, height=dp(24), font_size=dp(13))
     for w in (k, p, msg):
         box.add_widget(w)
-    pop = popup("Recovery Key se kholein", box, (.92, .5))
+    pop = popup("Unlock with Recovery Key", box, (.92, .5))
 
     def ok():
         pin = p.text.strip()
-        if len(pin) != 4 or not pin.isdigit():
-            msg.text = "PIN 4 ank ka hona chahiye"
+        if not valid_pin(pin):
+            msg.text = "PIN must be 4 to 12 digits"
             return
         m = st.parse_recovery_key(k.text)
         if m is None or not st.recover_with_key(m, pin):
-            msg.text = "Recovery Key galat hai"
+            msg.text = "Wrong Recovery Key"
             return
         pop.dismiss()
         after()
     row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(48))
     row.add_widget(btn("Cancel", pop.dismiss, SOFT))
-    row.add_widget(btn("Kholein", ok, GREEN))
+    row.add_widget(btn("Unlock", ok, GREEN))
     box.add_widget(row)
     pop.open()
 
 
-# ---------------- PIN keypad widget ----------------
+def make_tile(app, name, gen):
+    """Thumbnail tile. Videos get a frame from the video plus a play badge."""
+    t = Thumb()
+    if is_video(name):
+        t.set_vid(True)
+    app.thumb_q.put((gen, t, name, app.store.key))
+    return t
+
+
+def mark(tile, on):
+    if isinstance(tile, Thumb):
+        tile.set_sel(on)
+    else:
+        tile.set_bg(ACCENT if on else SOFT)
+
+
+# ---------------- PIN keypad (4 to 12 digits) ----------------
 class PinPad(BoxLayout):
     def __init__(self, on_pin, **kw):
-        super().__init__(orientation="vertical", padding=dp(30), spacing=dp(12), **kw)
+        super().__init__(orientation="vertical", padding=dp(24), spacing=dp(12), **kw)
         self.on_pin = on_pin
         self.buf = ""
-        self.title = Label(font_size=dp(22), bold=True, size_hint_y=.15)
+        self.title = Label(font_size=dp(22), bold=True, size_hint_y=.13)
         self.dots = PinDots(size_hint_y=.1)
         self.msg = Label(color=hx("#FF6B6B"), size_hint_y=.08)
         grid = GridLayout(cols=3, spacing=dp(12))
-        for k in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "C", "0", "<"]:
-            b = RBtn(text=k, font_size=dp(26), bg=CARD, radius=30)
+        for k in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "<", "0", "OK"]:
+            col = ACCENT if k == "OK" else CARD
+            b = RBtn(text=k, font_size=dp(26), bg=col, radius=16)
             b.bind(on_release=lambda x, k=k: self.press(k))
             grid.add_widget(b)
         for w in (self.title, self.dots, self.msg, grid):
             self.add_widget(w)
-        self.update()
-
-    def update(self):
-        self.dots.set(len(self.buf))
 
     def reset(self, title=None, msg=""):
         self.buf = ""
         if title:
             self.title.text = title
         self.msg.text = msg
-        self.update()
+        self.dots.set(0)
 
     def press(self, k):
         self.msg.text = ""
-        if k == "C":
-            self.buf = ""
-        elif k == "<":
+        if k == "<":
             self.buf = self.buf[:-1]
-        elif len(self.buf) < 4:
+        elif k == "OK":
+            if len(self.buf) < MIN_PIN:
+                self.msg.text = "PIN must be 4 to 12 digits"
+            else:
+                pin = self.buf
+                self.buf = ""
+                self.dots.set(0)
+                self.on_pin(pin)
+                return
+        elif len(self.buf) < MAX_PIN:
             self.buf += k
-        self.update()
-        if len(self.buf) == 4:
-            Clock.schedule_once(self._fire, .15)
-
-    def _fire(self, dt):
-        if len(self.buf) != 4:
-            return
-        pin = self.buf
-        self.buf = ""
-        self.update()
-        self.on_pin(pin)
+        self.dots.set(len(self.buf))
 
 
-# ---------------- PIN Screen ----------------
 class PinScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -941,14 +1287,14 @@ class PinScreen(Screen):
         root = BoxLayout(orientation="vertical", padding=(0, 0, 0, dp(8)))
         root.add_widget(self.pad)
         bx = BoxLayout(size_hint_y=None, height=dp(48), padding=(dp(20), 0))
-        bx.add_widget(btn("PIN bhool gaye? Recovery Key", self.forgot, SOFT, font_size=dp(13)))
+        bx.add_widget(btn("Forgot PIN? Use Recovery Key", self.forgot, SOFT, font_size=dp(13)))
         root.add_widget(bx)
         self.add_widget(root)
 
     def forgot(self):
         app = App.get_running_app()
         if not app.store.has_keys():
-            info("Recovery Key", "Abhi vault ki key nahi bani hai.\nPehle PIN banayein.", .3)
+            info("Recovery Key", "No vault key yet.\nCreate a PIN first.", .3)
             return
         recovery_popup(app.after_unlock)
 
@@ -960,7 +1306,7 @@ class PinScreen(Screen):
         elif st.is_legacy():
             self.mode, title = "legacy", "Enter PIN"
         else:
-            self.mode, title = "create", "Create 4-digit PIN"
+            self.mode, title = "create", "Create PIN (4-12 digits)"
         self.pad.reset(title)
 
     def on_pin(self, pin):
@@ -969,7 +1315,7 @@ class PinScreen(Screen):
         if self.mode in ("unlock", "legacy"):
             lu = st.cfg.get("lock_until", 0)
             if lu > time.time():
-                self.pad.msg.text = f"Bahut galat try. {int(lu - time.time()) + 1} sec baad try karein"
+                self.pad.msg.text = f"Too many attempts. Try again in {int(lu - time.time()) + 1} sec"
                 return
             if self.mode == "unlock":
                 m = st.unlock(pin)
@@ -991,7 +1337,7 @@ class PinScreen(Screen):
                 if f % 5 == 0:
                     wait = 30 * (f // 5)
                     st.cfg["lock_until"] = time.time() + wait
-                    msg = f"{f} galat try. {wait} sec ruko"
+                    msg = f"{f} wrong attempts. Wait {wait} sec"
                 st.save()
                 self.pad.msg.text = msg
         elif self.mode == "create":
@@ -1003,10 +1349,9 @@ class PinScreen(Screen):
                 app.after_unlock()
             else:
                 self.mode = "create"
-                self.pad.reset("Create 4-digit PIN", "PIN match nahi hua, dobara try karein")
+                self.pad.reset("Create PIN (4-12 digits)", "PINs do not match, try again")
 
 
-# ---------------- Change PIN Screen ----------------
 class ChangePinScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -1022,7 +1367,7 @@ class ChangePinScreen(Screen):
 
     def on_pre_enter(self, *a):
         self.step, self.master, self.first = "old", None, ""
-        self.pad.reset("Purana PIN daalein")
+        self.pad.reset("Enter current PIN")
 
     def on_pin(self, pin):
         app = App.get_running_app()
@@ -1033,58 +1378,67 @@ class ChangePinScreen(Screen):
                 self.pad.reset(msg="Wrong PIN!")
             else:
                 self.master, self.step = m, "new"
-                self.pad.reset("Naya PIN daalein")
+                self.pad.reset("Enter new PIN (4-12 digits)")
         elif self.step == "new":
             self.first, self.step = pin, "confirm"
-            self.pad.reset("Naya PIN confirm karein")
+            self.pad.reset("Confirm new PIN")
         else:
             if pin == self.first:
                 st.rewrap(self.master, pin)
-                info("Done", "PIN badal gaya!")
+                info("Done", "PIN changed!")
                 app.go("settings")
             else:
                 self.step = "new"
-                self.pad.reset("Naya PIN daalein", "PIN match nahi hua")
+                self.pad.reset("Enter new PIN (4-12 digits)", "PINs do not match")
 
 
-# ---------------- Settings Screen ----------------
+# ---------------- Settings ----------------
 class SettingsScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
         app = App.get_running_app()
         root = BoxLayout(orientation="vertical")
-        root.add_widget(header(title_label("Settings"), [], 64))
-        body = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
-        lbl = Label(text="Auto-lock (koi touch na ho to)", size_hint_y=None,
-                    height=dp(26), color=hx(MUTED), halign="left")
-        lbl.bind(size=lambda w, s: setattr(w, "text_size", s))
-        body.add_widget(lbl)
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        root.add_widget(header(title_label("Settings"), [
+            btn("Back", lambda: app.go("home"), SOFT, size_hint_x=None, width=dp(70))], 64))
+        sv = ScrollView()
+        body = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12), size_hint_y=None)
+        body.bind(minimum_height=body.setter("height"))
+
+        def row(text, cb, color=None):
+            body.add_widget(btn(text, cb, color, size_hint_y=None, height=dp(52)))
+
+        def section(text):
+            body.add_widget(lab(text, 14, True, MUTED, h=dp(30)))
+
+        row("Change Password", lambda: app.go("changepin"), ACCENT)
+        row("Show Recovery Key", self.show_key, GREEN)
+        row("Create Backup (Drive/Downloads)", self.backup)
+        row("Import from Backup", self.import_backup)
+        section("Advance")
+        row("App Themes", lambda: app.go("theme"))
+        row("Folder Style", lambda: app.go("folderstyle"))
+        row("Recycle Bin", lambda: app.go("trash"))
+        row("Change Language", lambda: app.go("language"))
+        section("Auto-lock (when idle)")
+        arow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
         self.abtns = {}
         for label, sec in AUTOLOCK_OPTS:
             b = btn(label, lambda s=sec: self.set_auto(s), font_size=dp(13), radius=18)
             self.abtns[sec] = b
-            row.add_widget(b)
-        body.add_widget(row)
-        body.add_widget(btn("Change PIN", lambda: app.go("changepin"), ACCENT,
-                            size_hint_y=None, height=dp(48)))
-        body.add_widget(btn("Recovery Key dikhayein", self.show_key, GREEN,
-                            size_hint_y=None, height=dp(48)))
-        body.add_widget(btn("Backup banayein (Drive/Downloads)", self.backup, SOFT,
-                            size_hint_y=None, height=dp(48)))
-        body.add_widget(btn("Backup se Import karein", self.import_backup, SOFT,
-                            size_hint_y=None, height=dp(48)))
+            arow.add_widget(b)
+        body.add_widget(arow)
         note = Label(
-            text=("Dhyan dein:\n"
-                  "- Recovery Key apne Gmail mein save kar lein. Iske bina PIN bhoolne par "
-                  "ya app uninstall hone par files wapas nahi aa sakti.\n"
-                  "- Backup file Drive mein rakhein. Wo sirf Recovery Key se khulti hai.\n"
-                  "- Restore ki hui files Gallery ke VaultRestored folder mein aati hain."),
-            halign="left", valign="top", color=hx(MUTED), font_size=dp(13))
-        note.bind(size=lambda w, s: setattr(w, "text_size", (s[0], s[1])))
+            text=("Note:\n"
+                  "- Save the Recovery Key (e.g. in your Gmail). Without it, files cannot be "
+                  "recovered if you forget the PIN or uninstall the app.\n"
+                  "- Keep the backup file in Drive. It opens only with the Recovery Key.\n"
+                  "- Unhidden files go to the Gallery folder VaultRestored."),
+            halign="left", valign="top", color=hx(MUTED), font_size=dp(13),
+            size_hint_y=None, height=dp(190))
+        note.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
         body.add_widget(note)
-        root.add_widget(body)
-        root.add_widget(nav_bar("settings"))
+        sv.add_widget(body)
+        root.add_widget(sv)
         self.add_widget(root)
 
     def on_pre_enter(self, *a):
@@ -1092,7 +1446,12 @@ class SettingsScreen(Screen):
         for sec, b in self.abtns.items():
             b.set_bg(ACCENT if sec == cur else CARD)
 
-    # ----- Recovery Key / Backup / Import -----
+    def set_auto(self, sec):
+        st = App.get_running_app().store
+        st.cfg["autolock"] = sec
+        st.save()
+        self.on_pre_enter()
+
     def show_key(self):
         app = App.get_running_app()
         try:
@@ -1106,8 +1465,8 @@ class SettingsScreen(Screen):
         lbl = Label(text=text, font_size=dp(17), halign="center")
         lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
         box.add_widget(lbl)
-        note = Label(text="Ise Gmail mein khud ko bhej kar ya Notes mein save karein.\n"
-                          "Kisi ko mat dein: isse poora vault khul sakta hai.",
+        note = Label(text="Send it to yourself on Gmail or save it in Notes.\n"
+                          "Do not share it: it can open the whole vault.",
                      halign="center", color=hx(MUTED), font_size=dp(13),
                      size_hint_y=None, height=dp(60))
         note.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
@@ -1120,33 +1479,33 @@ class SettingsScreen(Screen):
             try:
                 from kivy.core.clipboard import Clipboard
                 Clipboard.copy(key)
-                holder["b"].text = "Copy ho gaya!"
+                holder["b"].text = "Copied!"
             except Exception:
-                holder["b"].text = "Copy nahi hua"
+                holder["b"].text = "Copy failed"
 
         holder["b"] = btn("Copy", do_copy, ACCENT)
         row.add_widget(holder["b"])
-        row.add_widget(btn("Band karein", pop.dismiss, SOFT))
+        row.add_widget(btn("Close", pop.dismiss, SOFT))
         box.add_widget(row)
         pop.open()
 
     def backup(self):
-        ask("Backup banayein",
-            "Backup file Recovery Key ke bina khul nahi sakti.\n"
-            "Pehle 'Recovery Key dikhayein' se key save kar lein.\n\nAage badhein?",
-            self._pick_backup_dest)
+        ask("Create Backup",
+            "The backup cannot be opened without the Recovery Key.\n"
+            "Save the key first with 'Show Recovery Key'.\n\nContinue?",
+            self._pick_backup_dest, "Continue")
 
     def _pick_backup_dest(self):
         app = App.get_running_app()
         fname = "VaultBackup_" + time.strftime("%Y%m%d") + ".zip"
-        app.busy = True  # picker khulne par app auto-lock na ho
+        app.busy = True
 
         def got(uri):
             Clock.schedule_once(lambda dt: self._do_backup(uri))
 
         if not android_document("create", BACKUP_CODE, got, fname):
             app.busy = False
-            info("Backup", "Ye option sirf Android APK mein chalta hai.", .3)
+            info("Backup", "This works only in the Android APK.", .3)
 
     def _do_backup(self, uri):
         app = App.get_running_app()
@@ -1154,7 +1513,7 @@ class SettingsScreen(Screen):
         if not uri:
             app.busy = False
             return
-        lbl = Label(text="Backup ban raha hai...", halign="center")
+        lbl = Label(text="Creating backup...", halign="center")
         pop = popup("Backup", lbl, (.8, .25), auto_dismiss=False)
         pop.open()
         tmp = os.path.join(app.user_data_dir, "backup_tmp.zip")
@@ -1167,18 +1526,18 @@ class SettingsScreen(Screen):
             app.busy = False
             app.last = time.time()
             if err:
-                info("Backup fail", err[:150], .4)
+                info("Backup failed", err[:150], .4)
             elif n == 0:
-                info("Backup", "Vault abhi khali hai, backup mein koi file nahi gayi.", .3)
+                info("Backup", "Vault is empty, nothing was backed up.", .3)
             else:
-                info("Backup ho gaya", f"{n} files ka backup save ho gaya.\n"
-                     "Isse Google Drive mein rakhein, aur Recovery Key alag jagah.", .4)
+                info("Backup done", f"{n} files saved.\nKeep it in Google Drive and "
+                     "keep the Recovery Key somewhere else.", .4)
 
         def work():
             err, n = None, 0
             try:
                 n = app.store.make_backup(tmp, prog)
-                Clock.schedule_once(lambda dt: setattr(lbl, "text", "Save ho raha hai..."))
+                Clock.schedule_once(lambda dt: setattr(lbl, "text", "Saving..."))
                 copy_path_to_uri(tmp, uri)
             except Exception as e:
                 err = str(e)
@@ -1190,8 +1549,8 @@ class SettingsScreen(Screen):
     def import_backup(self):
         app = App.get_running_app()
         if app.store.media_list():
-            info("Import", "Import sirf khali vault mein ho sakta hai.\n"
-                 "App nayi install karke PIN banayein, phir yahan import karein.", .4)
+            info("Import", "Import works only on an empty vault.\n"
+                 "Reinstall the app, create a PIN, then import here.", .4)
             return
         app.busy = True
 
@@ -1200,7 +1559,7 @@ class SettingsScreen(Screen):
 
         if not android_document("open", OPEN_CODE, got):
             app.busy = False
-            info("Import", "Ye option sirf Android APK mein chalta hai.", .3)
+            info("Import", "This works only in the Android APK.", .3)
 
     def _got_backup(self, uri):
         app = App.get_running_app()
@@ -1208,7 +1567,7 @@ class SettingsScreen(Screen):
         if not uri:
             app.busy = False
             return
-        lbl = Label(text="Backup file padh raha hoon...", halign="center")
+        lbl = Label(text="Reading backup...", halign="center")
         pop = popup("Import", lbl, (.8, .25), auto_dismiss=False)
         pop.open()
         tmp = os.path.join(app.user_data_dir, "import_tmp.zip")
@@ -1217,7 +1576,7 @@ class SettingsScreen(Screen):
             pop.dismiss()
             app.busy = False
             _rm(tmp)
-            info("Import fail", err[:150], .4)
+            info("Import failed", err[:150], .4)
 
         def ready(n):
             pop.dismiss()
@@ -1239,16 +1598,16 @@ class SettingsScreen(Screen):
         app = App.get_running_app()
         st = app.store
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        box.add_widget(Label(text=f"Backup mein {count} files hain.", size_hint_y=None,
+        box.add_widget(Label(text=f"Backup has {count} files.", size_hint_y=None,
                              height=dp(24), font_size=dp(14)))
-        k = TextInput(hint_text="Recovery Key paste karein", multiline=False,
+        k = TextInput(hint_text="Paste Recovery Key", multiline=False,
                       size_hint_y=None, height=dp(46))
-        p = TextInput(hint_text="Naya 4-digit PIN", multiline=False, input_filter="int",
+        p = TextInput(hint_text="New PIN (4-12 digits)", multiline=False, input_filter="int",
                       password=True, size_hint_y=None, height=dp(46))
         msg = Label(color=hx("#FF6B6B"), size_hint_y=None, height=dp(24), font_size=dp(13))
         for w in (k, p, msg):
             box.add_widget(w)
-        pop = popup("Backup Import", box, (.92, .55), auto_dismiss=False)
+        pop = popup("Import Backup", box, (.92, .55), auto_dismiss=False)
 
         def cancel():
             pop.dismiss()
@@ -1257,12 +1616,12 @@ class SettingsScreen(Screen):
 
         def go():
             pin = p.text.strip()
-            if len(pin) != 4 or not pin.isdigit():
-                msg.text = "PIN 4 ank ka hona chahiye"
+            if not valid_pin(pin):
+                msg.text = "PIN must be 4 to 12 digits"
                 return
             m = st.parse_recovery_key(k.text)
             if m is None:
-                msg.text = "Recovery Key galat hai"
+                msg.text = "Wrong Recovery Key"
                 return
             pop.dismiss()
             self._run_import(tmp, m, pin)
@@ -1275,7 +1634,7 @@ class SettingsScreen(Screen):
 
     def _run_import(self, tmp, master, pin):
         app = App.get_running_app()
-        lbl = Label(text="Import ho raha hai...", halign="center")
+        lbl = Label(text="Importing...", halign="center")
         pop = popup("Import", lbl, (.8, .25), auto_dismiss=False)
         pop.open()
 
@@ -1288,10 +1647,11 @@ class SettingsScreen(Screen):
             app.last = time.time()
             _rm(tmp)
             if err:
-                info("Import fail", err[:150], .4)
+                info("Import failed", err[:150], .4)
                 return
-            info("Import ho gaya", f"{n} files wapas aa gayi.\nAb aapka naya PIN chalega.", .4)
-            app.show_gallery()
+            info("Import done", f"{n} files restored.\nYour new PIN is now active.", .4)
+            app.kind = "photo"
+            app.go("home")
 
         def work():
             n, err = 0, None
@@ -1303,25 +1663,313 @@ class SettingsScreen(Screen):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def set_auto(self, sec):
+
+# ---------------- Theme / Folder Style / Language ----------------
+class ThemeScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        app = App.get_running_app()
+        root = BoxLayout(orientation="vertical")
+        root.add_widget(header(title_label("App Themes"), [
+            btn("Back", lambda: app.go("settings"), SOFT, size_hint_x=None, width=dp(70))], 64))
+        body = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        body.add_widget(lab("Mode", 15, True, MUTED, h=dp(28)))
+        mrow = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
+        self.mbtns = {}
+        for key, label in [("light", "Light"), ("auto", "Auto"), ("night", "Night")]:
+            b = btn(label, lambda k=key: self.set_mode(k), radius=18)
+            self.mbtns[key] = b
+            mrow.add_widget(b)
+        body.add_widget(mrow)
+        body.add_widget(lab("Set Color", 15, True, MUTED, h=dp(34)))
+        grid = GridLayout(cols=4, spacing=dp(10), size_hint_y=None, height=dp(140))
+        self.cbtns = []
+        for i, (pastel, acc) in enumerate(SCHEMES):
+            b = RBtn(bg=pastel, radius=12)
+            b.bind(on_release=lambda w, i=i: self.set_scheme(i))
+            self.cbtns.append(b)
+            grid.add_widget(b)
+        body.add_widget(grid)
+        body.add_widget(lab("Auto = Night theme from 7 PM to 6 AM", 12, color=MUTED, h=dp(24)))
+        body.add_widget(Widget())
+        root.add_widget(body)
+        self.add_widget(root)
+
+    def on_pre_enter(self, *a):
+        cfg = App.get_running_app().store.cfg
+        for k, b in self.mbtns.items():
+            b.set_bg(ACCENT if k == cfg.get("theme", "light") else CARD)
+        for i, b in enumerate(self.cbtns):
+            b.text = "OK" if i == cfg.get("scheme", 0) else ""
+
+    def set_mode(self, k):
+        app = App.get_running_app()
+        app.store.cfg["theme"] = k
+        app.store.save()
+        app.restyle("theme")
+
+    def set_scheme(self, i):
+        app = App.get_running_app()
+        app.store.cfg["scheme"] = i
+        app.store.save()
+        app.restyle("theme")
+
+
+class FolderStyleScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        app = App.get_running_app()
+        root = BoxLayout(orientation="vertical")
+        root.add_widget(header(title_label("Folder Style"), [
+            btn("Back", lambda: app.go("home"), SOFT, size_hint_x=None, width=dp(70))], 64))
+        sv = ScrollView()
+        body = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12), size_hint_y=None)
+        body.bind(minimum_height=body.setter("height"))
+        self.rows = {}
+        for key, label, cols, h, desc in FOLDER_STYLES:
+            b = RBtn(text=f"{label}\n{desc}", bg=CARD, radius=12, size_hint_y=None,
+                     height=dp(66), halign="left")
+            b.bind(size=lambda w, s: setattr(w, "text_size", (s[0] - dp(24), None)))
+            b.bind(on_release=lambda w, k=key: self.pick(k))
+            self.rows[key] = b
+            body.add_widget(b)
+        sv.add_widget(body)
+        root.add_widget(sv)
+        self.add_widget(root)
+
+    def on_pre_enter(self, *a):
+        cur = App.get_running_app().store.cfg.get("folder_style", "default")
+        for k, b in self.rows.items():
+            b.set_bg(ACCENT if k == cur else CARD)
+
+    def pick(self, k):
         st = App.get_running_app().store
-        st.cfg["autolock"] = sec
+        st.cfg["folder_style"] = k
         st.save()
         self.on_pre_enter()
 
 
-# ---------------- Gallery Screen ----------------
-class GalleryScreen(Screen):
+class LanguageScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        app = App.get_running_app()
+        root = BoxLayout(orientation="vertical")
+        root.add_widget(header(title_label("Select Language"), [
+            btn("Back", lambda: app.go("settings"), SOFT, size_hint_x=None, width=dp(70))], 64))
+        sv = ScrollView()
+        body = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12), size_hint_y=None)
+        body.bind(minimum_height=body.setter("height"))
+        self.rows = {}
+        for code, name in LANGS:
+            b = RBtn(text=name, bg=CARD, radius=12, size_hint_y=None, height=dp(52),
+                     halign="left")
+            b.bind(size=lambda w, s: setattr(w, "text_size", (s[0] - dp(24), None)))
+            b.bind(on_release=lambda w, c=code, n=name: self.pick(c, n))
+            self.rows[code] = b
+            body.add_widget(b)
+        sv.add_widget(body)
+        root.add_widget(sv)
+        self.add_widget(root)
+
+    def on_pre_enter(self, *a):
+        cur = App.get_running_app().store.cfg.get("lang", "en")
+        for c, b in self.rows.items():
+            b.set_bg(ACCENT if c == cur else CARD)
+
+    def pick(self, code, name):
+        if code not in AVAILABLE_LANGS:
+            info("Language", f"{name} is not available yet.\nThe app is currently English only.", .32)
+            return
+        st = App.get_running_app().store
+        st.cfg["lang"] = code
+        st.save()
+        self.on_pre_enter()
+
+
+# ---------------- Recycle Bin ----------------
+class TrashScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        app = App.get_running_app()
+        self.sel, self.tiles = set(), {}
+        root = BoxLayout(orientation="vertical")
+        root.add_widget(header(title_label("Recycle Bin"), [
+            btn("Back", lambda: app.go("settings"), SOFT, size_hint_x=None, width=dp(70))], 64))
+        self.mid = BoxLayout()
+        self.empty = Label(text="Recycle bin is empty.\nFiles in the recycle bin are deleted "
+                                "automatically after 30 days.",
+                           halign="center", color=hx(MUTED), font_size=dp(15))
+        self.empty.bind(size=lambda w, s: setattr(w, "text_size", (s[0] - dp(40), None)))
+        self.sv = ScrollView()
+        self.grid = GridLayout(cols=3, spacing=dp(6), padding=dp(4),
+                               size_hint_y=None, row_force_default=True)
+        self.grid.bind(minimum_height=self.grid.setter("height"))
+        self.sv.add_widget(self.grid)
+        root.add_widget(self.mid)
+        self.bar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(8), padding=dp(8))
+        self.bar.add_widget(btn("Restore", self.restore, GREEN))
+        self.bar.add_widget(btn("Delete Forever", self.delete, RED))
+        root.add_widget(self.bar)
+        self.add_widget(root)
+
+    def on_pre_enter(self, *a):
+        self.sel.clear()
+        self.refresh()
+
+    def refresh(self):
+        app = App.get_running_app()
+        st = app.store
+        self.mid.clear_widgets()
+        self.grid.clear_widgets()
+        self.tiles = {}
+        if st.key is None:
+            return
+        names = st.trash_list()
+        self.bar.opacity = 1 if names else 0
+        self.bar.disabled = not names
+        if not names:
+            self.mid.add_widget(self.empty)
+            return
+        self.mid.add_widget(self.sv)
+        app.gen += 1
+        self.grid.row_default_height = (Window.width - dp(20)) / 3
+        for n in names:
+            t = make_tile(app, n, app.gen)
+            t.bind(on_release=lambda w, n=n: self.toggle(n))
+            self.tiles[n] = t
+            mark(t, n in self.sel)
+            self.grid.add_widget(t)
+
+    def toggle(self, n):
+        if n in self.sel:
+            self.sel.discard(n)
+        else:
+            self.sel.add(n)
+        mark(self.tiles[n], n in self.sel)
+
+    def restore(self):
+        if not self.sel:
+            info("Select files", "Tap the files you want to restore.", .28)
+            return
+        st = App.get_running_app().store
+        for n in list(self.sel):
+            try:
+                st.trash_restore(n)
+            except Exception:
+                pass
+        self.sel.clear()
+        self.refresh()
+
+    def delete(self):
+        if not self.sel:
+            info("Select files", "Tap the files you want to delete.", .28)
+            return
+
+        def go():
+            st = App.get_running_app().store
+            for n in list(self.sel):
+                st.delete(n)
+            self.sel.clear()
+            self.refresh()
+        ask("Delete Forever", f"Delete {len(self.sel)} file(s) permanently?", go, "Delete")
+
+
+# ---------------- Home (Photos / Videos tabs with folders) ----------------
+class HomeScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        app = App.get_running_app()
+        root = BoxLayout(orientation="vertical")
+        self.title = title_label("Photos")
+
+        def hb(text, cb, w):
+            return btn(text, cb, CARD, size_hint_x=None, width=dp(w), font_size=dp(12))
+        root.add_widget(header(self.title, [
+            hb("Style", lambda: app.go("folderstyle"), 54),
+            hb("Bin", lambda: app.go("trash"), 46),
+            hb("Lock", app.lock, 52),
+            hb("Settings", lambda: app.go("settings"), 72)], 64))
+
+        top = BoxLayout(size_hint_y=None, height=dp(84), spacing=dp(10), padding=dp(10))
+        self.create_btn = btn("Create\nNew folder  +", self.new_folder, CARD, radius=20)
+        self.all_btn = btn("All Photos\n0 Files", self.open_all, ACCENT, radius=20)
+        top.add_widget(self.create_btn)
+        top.add_widget(self.all_btn)
+        root.add_widget(top)
+
+        sv = ScrollView()
+        self.grid = GridLayout(cols=2, spacing=dp(10), padding=dp(10),
+                               size_hint_y=None, row_force_default=True)
+        self.grid.bind(minimum_height=self.grid.setter("height"))
+        sv.add_widget(self.grid)
+        root.add_widget(sv)
+
+        nav = BoxLayout(size_hint_y=None, height=dp(62), padding=(dp(8), dp(8)), spacing=dp(6))
+        paint_bg(nav, NAVBG)
+        self.tabs = {}
+        for label, kind in [("Photos", "photo"), ("Videos", "video")]:
+            b = btn(label, lambda k=kind: self.switch(k), NAVBG, radius=14)
+            self.tabs[kind] = b
+            nav.add_widget(b)
+        root.add_widget(nav)
+        self.add_widget(root)
+
+    def on_pre_enter(self, *a):
+        self.refresh()
+
+    def switch(self, kind):
+        App.get_running_app().kind = kind
+        self.refresh()
+
+    def new_folder(self):
+        app = App.get_running_app()
+        new_album_popup(lambda n: self.refresh(), app.kind)
+
+    def open_all(self):
+        App.get_running_app().open_folder(None)
+
+    def refresh(self):
+        app = App.get_running_app()
+        st, kind = app.store, app.kind
+        self.grid.clear_widgets()
+        if st.key is None:
+            return
+        word = "Photos" if kind == "photo" else "Videos"
+        self.title.text = word
+        for k, b in self.tabs.items():
+            b.set_bg(ACCENT if k == kind else NAVBG)
+        self.all_btn.text = f"All {word}\n{len(st.media_list(kind))} Files"
+        style = st.cfg.get("folder_style", "default")
+        cols, h = 2, 170
+        for key, label, c, hh, desc in FOLDER_STYLES:
+            if key == style:
+                cols, h = c, hh
+        self.grid.cols = cols
+        self.grid.row_default_height = dp(h)
+        app.gen += 1
+        gen = app.gen
+        for a in st.folders_for(kind):
+            items = st.album_items(a, kind)
+            photos = items
+            cell = FolderCell(style, a, len(items), bool(photos))
+            if photos and cell.cover is not None:
+                app.thumb_q.put((gen, cell.cover, photos[0], st.key))
+            cell.bind(on_release=lambda w, a=a: app.open_folder(a))
+            self.grid.add_widget(cell)
+
+
+# ---------------- Folder contents ----------------
+class FolderScreen(Screen):
     PAGE = 90
 
     def __init__(self, **kw):
         super().__init__(**kw)
         app = App.get_running_app()
         self.names, self.limit = [], self.PAGE
+        self.sel_mode, self.sel, self.tiles = False, set(), {}
         root = BoxLayout(orientation="vertical")
-
         tbox = BoxLayout(orientation="vertical")
-        self.title = Label(font_size=dp(24), bold=True, halign="left", valign="bottom",
+        self.title = Label(font_size=dp(22), bold=True, halign="left", valign="bottom",
                            shorten=True)
         self.title.bind(size=lambda w, s: setattr(w, "text_size", s))
         self.count = Label(font_size=dp(13), color=hx(MUTED), halign="left", valign="top",
@@ -1329,20 +1977,18 @@ class GalleryScreen(Screen):
         self.count.bind(size=lambda w, s: setattr(w, "text_size", s))
         tbox.add_widget(self.title)
         tbox.add_widget(self.count)
-        self.del_btn = btn("Del", self.del_album, RED, size_hint_x=None, width=0,
+        self.del_btn = btn("Del", self.del_folder, RED, size_hint_x=None, width=0,
                            opacity=0, disabled=True)
+        self.sel_btn = btn("Select", self.toggle_select_mode, CARD, size_hint_x=None,
+                           width=dp(72), font_size=dp(13))
         root.add_widget(header(tbox, [
-            self.del_btn,
-            btn("Lock", lambda: app.lock(), RED, size_hint_x=None, width=dp(62)),
-        ], 64))
+            self.del_btn, self.sel_btn,
+            btn("Back", self.back, SOFT, size_hint_x=None, width=dp(64), font_size=dp(13))], 64))
 
-        frow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8), padding=(dp(10), dp(4)))
-        self.fbtns = {}
-        for label, kind in [("All", "all"), ("Photos", "photo"), ("Videos", "video")]:
-            b = btn(label, lambda k=kind: self.set_kind(k), radius=18)
-            self.fbtns[kind] = b
-            frow.add_widget(b)
-        root.add_widget(frow)
+        self.imp_box = BoxLayout(size_hint_y=None, height=dp(66), padding=dp(8))
+        self.imp = btn("Import  +", self.start_import, CARD, radius=26)
+        self.imp_box.add_widget(self.imp)
+        root.add_widget(self.imp_box)
 
         sv = ScrollView()
         self.grid = GridLayout(cols=3, spacing=dp(6), padding=dp(4),
@@ -1350,14 +1996,47 @@ class GalleryScreen(Screen):
         self.grid.bind(minimum_height=self.grid.setter("height"))
         sv.add_widget(self.grid)
         root.add_widget(sv)
-        root.add_widget(nav_bar("gallery"))
+
+        self.bar = BoxLayout(size_hint_y=None, height=0, opacity=0, disabled=True,
+                             spacing=dp(8), padding=dp(8))
+        self.bar.add_widget(btn("Move", self.do_move, ACCENT))
+        self.bar.add_widget(btn("Unhide", self.do_unhide, GREEN))
+        self.bar.add_widget(btn("Delete", self.do_delete, RED))
+        root.add_widget(self.bar)
         self.add_widget(root)
 
-    def set_kind(self, k):
-        App.get_running_app().kind = k
+    # ----- helpers -----
+    def _show(self, widget, on, h):
+        widget.height = h if on else 0
+        widget.opacity = 1 if on else 0
+        widget.disabled = not on
+
+    def back(self):
+        if self.sel_mode:
+            self.set_select_mode(False)
+        else:
+            App.get_running_app().go("home")
+
+    def on_pre_enter(self, *a):
+        self.set_select_mode(False, refresh=False)
         self.refresh()
 
-    def del_album(self):
+    def set_select_mode(self, on, refresh=True):
+        self.sel_mode = on
+        self.sel.clear()
+        self.sel_btn.text = "Cancel" if on else "Select"
+        self._show(self.bar, on, dp(64))
+        if refresh:
+            self.refresh(False)
+
+    def toggle_select_mode(self):
+        self.set_select_mode(not self.sel_mode)
+
+    def start_import(self):
+        app = App.get_running_app()
+        app.start_pick(app.current_album, app.kind)
+
+    def del_folder(self):
         app = App.get_running_app()
         album = app.current_album
         if not album:
@@ -1366,11 +2045,8 @@ class GalleryScreen(Screen):
         def go():
             app.store.delete_album(album)
             app.current_album = None
-            self.refresh()
-        ask("Album hatayein", f"'{album}' album hatayein?\n(Files vault mein hi rahengi)", go)
-
-    def on_pre_enter(self, *a):
-        self.refresh()
+            app.go("home")
+        ask("Delete folder", f"Delete folder '{album}'?\n(Files stay in the vault)", go, "Delete")
 
     def more(self):
         self.limit += self.PAGE
@@ -1382,36 +2058,91 @@ class GalleryScreen(Screen):
         if reset:
             self.limit = self.PAGE
         self.grid.clear_widgets()
+        self.tiles = {}
         if st.key is None:
             return
         self.names = st.album_items(album, kind) if album else st.media_list(kind)
-        self.title.text = album if album else "Vault"
-        if album:
-            self.del_btn.width, self.del_btn.opacity, self.del_btn.disabled = dp(62), 1, False
-        else:
-            self.del_btn.width, self.del_btn.opacity, self.del_btn.disabled = 0, 0, True
-        for k, b in self.fbtns.items():
-            b.set_bg(ACCENT if k == kind else CARD)
+        word = "Photos" if kind == "photo" else "Videos"
         n = len(self.names)
-        v = sum(1 for x in self.names if is_video(x))
-        self.count.text = f"{n - v} photos  |  {v} videos" if n else "Kuch nahi hai - Import dabaiye"
+        if self.sel_mode:
+            self.title.text = f"({len(self.sel)}) Selected"
+        else:
+            self.title.text = album if album else f"All {word}"
+        self.count.text = f"{n} files" if n else "Empty"
+        self.imp.text = f"Import {word}  +"
+        self._show(self.imp_box, bool(album) and not self.sel_mode, dp(66))
+        can_del = bool(album) and album not in DEFAULT_FOLDERS and not self.sel_mode
+        self.del_btn.width, self.del_btn.opacity, self.del_btn.disabled = \
+            (dp(52), 1, False) if can_del else (0, 0, True)
         app.gen += 1
         gen = app.gen
-        size = (Window.width - dp(8) - dp(12)) / 3
-        self.grid.row_default_height = size
+        self.grid.row_default_height = (Window.width - dp(8) - dp(12)) / 3
         for i, name in enumerate(self.names[:self.limit]):
-            if is_video(name):
-                t = RBtn(text="VIDEO\nPLAY", bg=SOFT, radius=10, halign="center")
-            else:
-                t = Thumb()
-                app.thumb_q.put((gen, t, name, st.key))
-            t.bind(on_release=lambda w, i=i: app.open_viewer(self.names, i))
+            t = make_tile(app, name, gen)
+            t.bind(on_release=lambda w, i=i, name=name: self.tap(i, name))
+            self.tiles[name] = t
+            if name in self.sel:
+                mark(t, True)
             self.grid.add_widget(t)
         if n > self.limit:
-            self.grid.add_widget(btn(f"+{n - self.limit}\naur", self.more, SOFT, radius=10))
+            self.grid.add_widget(btn(f"+{n - self.limit}\nmore", self.more, SOFT, radius=10))
+
+    def tap(self, i, name):
+        if self.sel_mode:
+            if name in self.sel:
+                self.sel.discard(name)
+            else:
+                self.sel.add(name)
+            mark(self.tiles[name], name in self.sel)
+            self.title.text = f"({len(self.sel)}) Selected"
+        else:
+            App.get_running_app().open_viewer(self.names, i)
+
+    # ----- actions on selected files -----
+    def _need_sel(self):
+        if not self.sel:
+            info("Select files", "Tap the files first.", .28)
+            return False
+        return True
+
+    def do_delete(self):
+        if not self._need_sel():
+            return
+
+        def go(perm):
+            st = App.get_running_app().store
+            for n in list(self.sel):
+                try:
+                    st.delete(n) if perm else st.trash_move(n)
+                except Exception:
+                    pass
+            self.set_select_mode(False)
+        delete_dialog(len(self.sel), go)
+
+    def do_unhide(self):
+        if not self._need_sel():
+            return
+        names = list(self.sel)
+        ask("Unhide", "Selected files will go back to your phone Gallery\n"
+            "and be removed from the vault. Continue?",
+            lambda: App.get_running_app().unhide(names, lambda: self.set_select_mode(False)),
+            "Unhide")
+
+    def do_move(self):
+        if not self._need_sel():
+            return
+        app = App.get_running_app()
+        src = app.current_album
+        folders = [f for f in app.store.folders_for(app.kind) if f != src]
+
+        def go(dst):
+            for n in list(self.sel):
+                app.store.move_to_album(n, src, dst)
+            self.set_select_mode(False)
+        folder_picker("Move to folder", folders, go)
 
 
-# ---------------- Viewer Screen ----------------
+# ---------------- Viewer ----------------
 class ViewerScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -1420,15 +2151,15 @@ class ViewerScreen(Screen):
         root = BoxLayout(orientation="vertical")
         self.pos_lbl = Label(font_size=dp(16), bold=True)
         root.add_widget(header(self.pos_lbl, [
-            btn("Back", lambda: app.go("gallery"), SOFT, size_hint_x=None, width=dp(70))]))
+            btn("Back", lambda: app.go("folder"), SOFT, size_hint_x=None, width=dp(70))]))
         self.stage = SwipeStage(self.step)
         root.add_widget(self.stage)
         bar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(5), padding=dp(6))
         bar.add_widget(btn("<", lambda: self.step(-1), SOFT, size_hint_x=.6))
         self.play_btn = btn("Pause", self.toggle_play, SOFT, font_size=dp(12))
         bar.add_widget(self.play_btn)
-        bar.add_widget(btn("+Album", self.pick_album, ACCENT, font_size=dp(12)))
-        bar.add_widget(btn("Restore", self.restore, GREEN, font_size=dp(12)))
+        bar.add_widget(btn("+Folder", self.pick_album, ACCENT, font_size=dp(12)))
+        bar.add_widget(btn("Unhide", self.restore, GREEN, font_size=dp(12)))
         bar.add_widget(btn("Delete", self.delete, RED, font_size=dp(12)))
         bar.add_widget(btn(">", lambda: self.step(1), SOFT, size_hint_x=.6))
         root.add_widget(bar)
@@ -1459,7 +2190,7 @@ class ViewerScreen(Screen):
         self.stop_video()
         self.stage.clear_widgets()
         if not self.names:
-            app.go("gallery")
+            app.go("folder")
             return
         self.i %= len(self.names)
         name = self.names[self.i]
@@ -1483,19 +2214,77 @@ class ViewerScreen(Screen):
             return
         self.stage.clear_widgets()
         if err:
-            self.stage.add_widget(Label(text="Open nahi hua: " + err[:100]))
+            self.stage.add_widget(Label(text="Could not open: " + err[:100]))
             return
         if is_video(name):
-            if Video is None:
-                self.stage.add_widget(Label(text="Video player available nahi"))
+            if not video_provider_ok():
+                self.show_external(path, "ffpyplayer not available: " + (FFPY_ERR or "no video engine"))
                 return
             try:
                 self.vid = Video(source=path, state="play", options={"eos": "loop"})
                 self.stage.add_widget(self.vid)
-            except Exception:
-                self.stage.add_widget(Label(text="Ye video play nahi ho paayi"))
-        else:
-            self.stage.add_widget(Image(source=path))
+                self.play_btn.disabled = False
+                self.play_btn.text = "Pause"
+                Clock.schedule_once(lambda dt: self.check_video(tok, path), 4)
+            except Exception as e:
+                self.show_external(path, "Player error: " + str(e)[:80])
+            return
+        self.stage.add_widget(Image(source=path))
+
+    def check_video(self, tok, path):
+        """If the in-app player showed nothing after 4 sec, offer the phone's player."""
+        if tok != self.tok or self.vid is None:
+            return
+        if not self.vid.texture:
+            self.stop_video()
+            self.stage.clear_widgets()
+            self.show_external(path, "ffpyplayer started but showed no picture")
+
+    def show_external(self, path, why=""):
+        """Videos always play in the phone's own video player."""
+        self.play_btn.disabled = True
+        self.play_btn.text = "-"
+        box = BoxLayout(orientation="vertical", spacing=dp(14), padding=dp(24))
+        msg = Label(text="Tap the button to play this video\n"
+                         "in your phone's video player.\n\n" + (why and "[Reason] " + why),
+                    halign="center", color=hx(TXT))
+        msg.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(msg)
+        box.add_widget(btn("Open in video player", lambda: self.open_external(path), GREEN,
+                           size_hint_y=None, height=dp(60), radius=26))
+        box.add_widget(Widget(size_hint_y=.4))
+        self.stage.add_widget(box)
+
+    def open_external(self, path):
+        app = App.get_running_app()
+        app.busy = True
+        app.external = True
+        lbl = Label(text="Preparing video...", halign="center")
+        pop = popup("Video", lbl, (.8, .25), auto_dismiss=False)
+        pop.open()
+
+        def done(ok, err):
+            pop.dismiss()
+            app.last = time.time()
+            if not ok:
+                app.busy = False
+                app.external = False
+                info("Cannot play", "No video player could be started.\n" + err[:100], .4)
+
+        def work():
+            ok, err = False, ""
+            try:
+                os.makedirs(PLAY_DIR, exist_ok=True)
+                open(os.path.join(PLAY_DIR, ".nomedia"), "a").close()
+                dst = os.path.join(PLAY_DIR, os.path.basename(path))
+                if not (os.path.exists(dst) and os.path.getsize(dst) > 0):
+                    shutil.copyfile(path, dst)
+                ok, err = play_external(dst)
+            except Exception as e:
+                err = str(e)
+            Clock.schedule_once(lambda dt: done(ok, err))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def toggle_play(self):
         if self.vid is None:
@@ -1514,353 +2303,232 @@ class ViewerScreen(Screen):
         self.load()
 
     def delete(self):
-        def go():
-            app = App.get_running_app()
+        if not self.names:
+            return
+        name = self.names[self.i]
+
+        def go(perm):
+            st = App.get_running_app().store
             self.stop_video()
-            app.store.delete(self.names[self.i])
-            self.names.pop(self.i)
+            try:
+                st.delete(name) if perm else st.trash_move(name)
+            except Exception:
+                pass
+            if name in self.names:
+                self.names.remove(name)
             self.load()
-        ask("Delete", "Ye file vault se hamesha ke liye delete karein?", go)
+        delete_dialog(1, go)
 
     def restore(self):
+        if not self.names:
+            return
         app = App.get_running_app()
         name = self.names[self.i]
 
         def go():
             self.stop_video()
-            key = app.store.key
-            lbl = Label(text="Restore ho raha hai...", halign="center")
-            pop = popup("Restore", lbl, (.8, .25), auto_dismiss=False)
-            pop.open()
-            app.busy = True
 
-            def done(dest, err):
-                pop.dismiss()
-                app.busy = False
-                app.last = time.time()
-                if err:
-                    info("Restore fail", err[:150], .35)
-                    self.load()
-                    return
-                app.store.delete(name)
+            def after():
                 if name in self.names:
                     self.names.remove(name)
-                info("Restore ho gayi",
-                     "File Gallery mein (VaultRestored folder) wapas aa gayi aur vault se hat gayi.\n"
-                     "Gallery mein dikhne mein thoda time lag sakta hai.", .4)
                 self.load()
-
-            def work():
-                try:
-                    dest, err = app.store.restore_file(name, key), None
-                except Exception as e:
-                    dest, err = None, str(e)
-                Clock.schedule_once(lambda dt: done(dest, err))
-            threading.Thread(target=work, daemon=True).start()
-        ask("Restore", "Ye file wapas phone storage mein chali jayegi\naur vault se hat jayegi. Karein?", go)
+            app.unhide([name], after)
+        ask("Unhide", "This file will go back to your phone Gallery\nand be removed from the vault. "
+            "Continue?", go, "Unhide")
 
     def pick_album(self):
+        if not self.names:
+            return
         app = App.get_running_app()
         name = self.names[self.i]
+        kind = "video" if is_video(name) else "photo"
+
+        def add(a):
+            app.store.add_to_album(a, name)
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        pop = popup("Add to Album", box, (.85, .6))
-        for a in app.store.cfg["albums"]:
-            box.add_widget(btn(a, lambda a=a: (app.store.add_to_album(a, name), pop.dismiss())))
-        box.add_widget(btn("+ New Album", lambda: (
-            pop.dismiss(),
-            new_album_popup(lambda n: app.store.add_to_album(n, name))), ACCENT))
+        pop = popup("Add to Folder", box, (.85, .6))
+        for a in app.store.folders_for(kind):
+            box.add_widget(btn(a, lambda a=a: (add(a), pop.dismiss())))
+        box.add_widget(btn("+ New Folder", lambda: (
+            pop.dismiss(), new_album_popup(add, kind)), ACCENT))
         pop.open()
 
 
-# ---------------- Albums Screen ----------------
-class AlbumsScreen(Screen):
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        app = App.get_running_app()
-        root = BoxLayout(orientation="vertical")
-        root.add_widget(header(title_label("Albums"), [
-            btn("+ New", lambda: new_album_popup(lambda n: self.refresh()), ACCENT,
-                size_hint_x=None, width=dp(76))], 64))
-        sv = ScrollView()
-        self.grid = GridLayout(cols=2, spacing=dp(10), padding=dp(10),
-                               size_hint_y=None, row_force_default=True)
-        self.grid.bind(minimum_height=self.grid.setter("height"))
-        sv.add_widget(self.grid)
-        root.add_widget(sv)
-        root.add_widget(nav_bar("albums"))
-        self.add_widget(root)
-
-    def on_pre_enter(self, *a):
-        self.refresh()
-
-    def refresh(self):
-        app = App.get_running_app()
-        st = app.store
-        self.grid.clear_widgets()
-        if st.key is None:
-            return
-        app.gen += 1
-        gen = app.gen
-        w = (Window.width - dp(30)) / 2
-        self.grid.row_default_height = w + dp(50)
-
-        def open_album(a):
-            app.current_album = a
-            app.go("gallery")
-
-        def add(title, names, a):
-            card = AlbumCard(title, len(names))
-            card.bind(on_release=lambda *x, a=a: open_album(a))
-            photos = [n for n in names if not is_video(n)]
-            if photos:
-                app.thumb_q.put((gen, card.cover, photos[0], st.key))
-            self.grid.add_widget(card)
-        add("All Media", st.media_list(), None)
-        for a in list(st.cfg["albums"]):
-            add(a, st.album_items(a), a)
-
-
-# ---------------- Import Screen (custom browser) ----------------
+# ---------------- In-app phone gallery (used when the system picker is unavailable, e.g. Pydroid) ----------------
 class ImportScreen(Screen):
-    PAGE = 120
+    PAGE = 60
 
     def __init__(self, **kw):
         super().__init__(**kw)
         app = App.get_running_app()
         self.move = False
-        self.sel = set()
-        self.path = ROOT
-        self.limit = self.PAGE
-        self.dirs, self.media, self.other, self.err = [], [], 0, ""
-
+        self.items, self.sel, self.tiles = [], set(), {}
+        self.limit, self.filt, self.scan_id, self.gen = self.PAGE, "all", 0, 0
         root = BoxLayout(orientation="vertical")
-        root.add_widget(header(title_label("Import Media"), [
-            btn("Help", self.help, SOFT, size_hint_x=None, width=dp(64)),
-            btn("Back", lambda: app.go("gallery"), SOFT, size_hint_x=None, width=dp(70))], 64))
-
-        quick = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6), padding=(dp(8), 0))
-        for label, sub in [("DCIM", "DCIM"), ("Pictures", "Pictures"),
-                           ("Movies", "Movies"), ("Download", "Download")]:
-            quick.add_widget(btn(label, lambda s=sub: self.load(os.path.join(ROOT, s)),
-                                 radius=18, font_size=dp(13)))
-        root.add_widget(quick)
-
-        self.path_lbl = Label(size_hint_y=None, height=dp(26), font_size=dp(12),
-                              color=hx(MUTED), halign="left", shorten=True,
-                              shorten_from="left")
-        self.path_lbl.bind(size=lambda w, s: setattr(w, "text_size", s))
-        root.add_widget(self.path_lbl)
-
-        self.status = Label(size_hint_y=None, height=dp(54), font_size=dp(13),
-                            halign="center", color=hx("#FFD166"))
+        root.add_widget(header(title_label("Phone Gallery"), [
+            btn("Back", app.show_folder, SOFT, size_hint_x=None, width=dp(70))], 64))
+        frow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8), padding=(dp(10), dp(4)))
+        self.fbtns = {}
+        for label, k in [("All", "all"), ("Photos", "photo"), ("Videos", "video")]:
+            b = btn(label, lambda k=k: self.set_filter(k), radius=18)
+            self.fbtns[k] = b
+            frow.add_widget(b)
+        root.add_widget(frow)
+        self.status = Label(size_hint_y=None, height=dp(40), font_size=dp(13),
+                            halign="center", color=hx(MUTED))
         self.status.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
         root.add_widget(self.status)
-
         sv = ScrollView()
-        self.box = BoxLayout(orientation="vertical", spacing=dp(4), padding=dp(6),
-                             size_hint_y=None)
-        self.box.bind(minimum_height=self.box.setter("height"))
-        sv.add_widget(self.box)
+        self.grid = GridLayout(cols=3, spacing=dp(6), padding=dp(4),
+                               size_hint_y=None, row_force_default=True)
+        self.grid.bind(minimum_height=self.grid.setter("height"))
+        sv.add_widget(self.grid)
         root.add_widget(sv)
-
-        self.sel_lbl = Label(size_hint_y=None, height=dp(24), color=hx(MUTED))
-        root.add_widget(self.sel_lbl)
-
         row1 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6), padding=(dp(8), 0))
         row1.add_widget(btn("Select All", self.select_all))
         row1.add_widget(btn("Clear", self.clear_sel))
         self.move_btn = btn("Move: OFF", self.toggle_move)
         row1.add_widget(self.move_btn)
         root.add_widget(row1)
-
-        row2 = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=(dp(8), dp(6)))
-        row2.add_widget(btn("Import Selected", self.import_selected, GREEN))
-        row2.add_widget(btn("Import Folder (All)", self.import_folder, ACCENT))
+        row2 = BoxLayout(size_hint_y=None, height=dp(60), padding=(dp(8), dp(6)))
+        self.imp = btn("Import  +", self.do_import, GREEN)
+        row2.add_widget(self.imp)
         root.add_widget(row2)
         self.add_widget(root)
 
-    def diagnose(self):
-        lines = []
-        for sub in ("DCIM/Camera", "DCIM", "Pictures", "Download", "Movies"):
-            p = os.path.join(ROOT, sub)
-            try:
-                names = os.listdir(p)
-                m = sum(1 for n in names if n.lower().endswith(ALL_EXTS))
-                lines.append(f"{sub}: {len(names)} items, {m} media")
-            except Exception as e:
-                lines.append(f"{sub}: ERROR {str(e)[:40]}")
-        return "\n".join(lines)
-
-    def help(self):
-        info("Files nahi dikh rahi?",
-             "TEST:\n" + self.diagnose() + "\n\n"
-             "Agar 'ERROR' ya '0 media' hai to permission baaki hai:\n"
-             "Settings > Apps > Pydroid 3 > Permissions mein Files and media / "
-             "Photos and videos ALLOW karein, aur Special app access > "
-             "All files access > Pydroid 3 ON karein. Phir Force stop karke dobara kholein.", .75)
-
-    def start_gallery_pick(self):
+    def on_pre_enter(self, *a):
         app = App.get_running_app()
-        if app.store.key is None:
-            return False
-        app.busy = True  # picker khulne par app auto-lock na ho
+        self.sel.clear()
+        self.limit = self.PAGE
+        self.filt = "video" if app.kind == "video" else "photo"
+        self.scan()
 
-        def got(uris):
-            Clock.schedule_once(lambda dt: self.picked(uris))
-
-        if open_gallery_picker(got):
-            return True
-        app.busy = False
-        return False
-
-    def picked(self, uris):
-        app = App.get_running_app()
-        app.last = time.time()
-        key = app.store.key
-        if not uris or key is None:
-            app.busy = False
-            app.go("gallery")
-            return
-        total = len(uris)
-        tmpdir = os.path.join(app.user_data_dir, "tmp_import")
-        lbl = Label(text=f"Importing 0/{total}", halign="center")
-        pop = popup("Encrypt + Import ho raha hai...", lbl, (.8, .25), auto_dismiss=False)
-        pop.open()
-
-        def finish(ok, err):
-            pop.dismiss()
-            app.busy = False
-            app.last = time.time()
-            msg = f"{ok}/{total} files vault mein add ho gayi!"
-            if ok:
-                msg += "\n\nAsli files Gallery mein abhi bhi hain. Vault mein dekh kar tasalli ho jaye to unhe Gallery se khud delete kar dein."
-            if ok < total and err:
-                msg += "\nError: " + err[:120]
-            info("Done", msg, .5)
-            app.show_gallery()
+    def scan(self):
+        self.scan_id += 1
+        sid = self.scan_id
+        self.status.text = "Loading your gallery..."
+        self.grid.clear_widgets()
 
         def work():
-            ok, last_err = 0, ""
-            for i, u in enumerate(uris):
-                tmp = None
+            found, stack = [], [(ROOT, 0)]
+            while stack and len(found) < 6000:
+                d, depth = stack.pop()
                 try:
-                    tmp = copy_uri_to_file(u, tmpdir, i)
-                    e = app.store.add_one(tmp, i, True, key)
-                except Exception as ex:
-                    e = str(ex)
-                if e is None:
-                    ok += 1
-                else:
-                    last_err = e
-                    if tmp:
-                        _rm(tmp)
-                Clock.schedule_once(
-                    lambda dt, i=i: setattr(lbl, "text", f"Importing {i + 1}/{total}"))
-            Clock.schedule_once(lambda dt: finish(ok, last_err))
-
+                    names = os.listdir(d)
+                except Exception:
+                    continue
+                for n in names:
+                    if n.startswith("."):
+                        continue
+                    p = os.path.join(d, n)
+                    low = n.lower()
+                    if low.endswith(ALL_EXTS):
+                        try:
+                            found.append((p, os.path.getmtime(p)))
+                        except Exception:
+                            pass
+                    elif depth < 6 and low != "android" and os.path.isdir(p):
+                        stack.append((p, depth + 1))
+            found.sort(key=lambda x: x[1], reverse=True)
+            Clock.schedule_once(lambda dt: self.scanned(sid, found))
         threading.Thread(target=work, daemon=True).start()
 
-    def on_pre_enter(self, *a):
-        if self.start_gallery_pick():
+    def scanned(self, sid, found):
+        if sid != self.scan_id:
             return
-        start = self.path if os.path.exists(self.path) else ROOT
-        if not os.path.exists(start):
-            start = os.path.expanduser("~")
-        self.load(start)
+        self.items = [p for p, m in found]
+        self.draw()
 
-    # ----- folder scan -----
-    def load(self, path):
-        self.path, self.limit = path, self.PAGE
-        dirs, media, other, err = [], [], 0, ""
-        try:
-            names = os.listdir(path)
-        except Exception as e:
-            names, err = [], str(e)
-        for n in names:
-            if n.startswith("."):
-                continue
-            p = os.path.join(path, n)
-            try:
-                if os.path.isdir(p):
-                    dirs.append(n)
-                elif n.lower().endswith(ALL_EXTS):
-                    media.append(p)
-                else:
-                    other += 1
-            except Exception:
-                pass
+    def visible(self):
+        if self.filt == "photo":
+            return [p for p in self.items if not is_video(p)]
+        if self.filt == "video":
+            return [p for p in self.items if is_video(p)]
+        return self.items
 
-        def mt(p):
-            try:
-                return os.path.getmtime(p)
-            except Exception:
-                return 0
-        dirs.sort(key=str.lower)
-        media.sort(key=mt, reverse=True)
-        self.dirs, self.media, self.other, self.err = dirs, media, other, err
+    def set_filter(self, k):
+        self.filt, self.limit = k, self.PAGE
         self.draw()
 
     def draw(self):
-        self.box.clear_widgets()
-        self.path_lbl.text = self.path
-        if self.err:
-            self.status.text = ("Folder khul nahi raha: " + self.err +
-                                "\nPhone Settings > Apps > Pydroid 3 > Permissions > "
-                                "Files/Photos and videos > ALLOW (All files access)")
-        elif not (self.dirs or self.media or self.other):
-            self.status.text = ("Folder khali hai ya Android ne access block kiya.\n"
-                                "Pydroid 3 ko Settings mein 'All files access' dein.")
+        app = App.get_running_app()
+        self.grid.clear_widgets()
+        self.tiles = {}
+        self.gen += 1
+        gen = self.gen
+        for k, b in self.fbtns.items():
+            b.set_bg(ACCENT if k == self.filt else CARD)
+        vis = self.visible()
+        if not vis:
+            self.status.text = ("No files found.\nAllow 'All files access' for Pydroid 3 in "
+                                "phone Settings, then reopen.")
         else:
-            t = (f"{len(self.dirs)} folders  |  {len(self.media)} photos/videos"
-                 f"  |  {self.other} other files")
-            if self.path != ROOT and not self.media and not self.other:
-                t += "\nFiles nahi dikh rahi? Upar Help dabaiye"
-            self.status.text = t
-        self.sel_lbl.text = f"{len(self.sel)} selected"
-
-        up = os.path.dirname(self.path.rstrip("/"))
-        if up and up != self.path:
-            self.box.add_widget(btn("[ .. ]  Upar jaayein", lambda: self.load(up),
-                                    SOFT, size_hint_y=None, height=dp(44), radius=10))
-        for d in self.dirs:
-            self.box.add_widget(btn("[DIR]  " + d,
-                                    lambda d=d: self.load(os.path.join(self.path, d)),
-                                    CARD, size_hint_y=None, height=dp(44), radius=10))
-        for p in self.media[:self.limit]:
-            self.box.add_widget(self.media_btn(p))
-        if len(self.media) > self.limit:
-            self.box.add_widget(btn(f"Aur dikhaiye ({len(self.media) - self.limit} baaki)",
-                                    self.more, SOFT, size_hint_y=None, height=dp(44), radius=10))
-
-    def media_btn(self, p):
-        name = os.path.basename(p)
-        icon = "VID" if is_video(name) else "IMG"
-        on = p in self.sel
-        b = RBtn(text=("[X] " if on else "[  ] ") + icon + "  " + name,
-                 bg=GREEN if on else CARD, radius=10,
-                 size_hint_y=None, height=dp(44), halign="left", shorten=True,
-                 shorten_from="right")
-        b.bind(size=lambda w, s: setattr(w, "text_size", (s[0] - dp(16), None)))
-
-        def toggle(*a):
-            if p in self.sel:
-                self.sel.discard(p)
-                b.text = "[  ] " + icon + "  " + name
-                b.set_bg(CARD)
+            self.status.text = f"{len(vis)} files  |  {len(self.sel)} selected"
+        self.grid.row_default_height = (Window.width - dp(20)) / 3
+        pairs = []
+        for p in vis[:self.limit]:
+            if is_video(p):
+                t = RBtn(text="VIDEO\n" + os.path.basename(p)[:14], bg=SOFT, radius=10,
+                         halign="center", font_size=dp(11))
             else:
-                self.sel.add(p)
-                b.text = "[X] " + icon + "  " + name
-                b.set_bg(GREEN)
-            self.sel_lbl.text = f"{len(self.sel)} selected"
-        b.bind(on_release=toggle)
-        return b
+                t = Thumb()
+                pairs.append((t, p))
+            t.bind(on_release=lambda w, p=p: self.toggle(p))
+            self.tiles[p] = t
+            if p in self.sel:
+                mark(t, True)
+            self.grid.add_widget(t)
+        if len(vis) > self.limit:
+            self.grid.add_widget(btn(f"+{len(vis) - self.limit}\nmore", self.more, SOFT, radius=10))
+        self.imp.text = f"Import  +  ({len(self.sel)})" if self.sel else "Import  +"
+
+        def work():
+            for t, p in pairs:
+                if gen != self.gen:
+                    return
+                tp = self.make_thumb(p)
+                if tp:
+                    Clock.schedule_once(lambda dt, t=t, tp=tp: setattr(t, "source", tp)
+                                        if gen == self.gen else None)
+        threading.Thread(target=work, daemon=True).start()
+
+    def make_thumb(self, p):
+        try:
+            cdir = App.get_running_app().store.cache
+            tp = os.path.join(cdir, "g_" + hashlib.md5(p.encode()).hexdigest()[:16] + ".jpg")
+            if os.path.exists(tp):
+                return tp
+            if PILImage is None:
+                return p
+            im = PILImage.open(p)
+            try:
+                im.draft("RGB", (400, 400))
+            except Exception:
+                pass
+            im = im.convert("RGB")
+            im.thumbnail((300, 300))
+            im.save(tp, "JPEG", quality=75)
+            return tp
+        except Exception:
+            return None
 
     def more(self):
         self.limit += self.PAGE
         self.draw()
 
+    def toggle(self, p):
+        if p in self.sel:
+            self.sel.discard(p)
+        else:
+            self.sel.add(p)
+        if p in self.tiles:
+            mark(self.tiles[p], p in self.sel)
+        vis = self.visible()
+        self.status.text = f"{len(vis)} files  |  {len(self.sel)} selected"
+        self.imp.text = f"Import  +  ({len(self.sel)})" if self.sel else "Import  +"
+
     def select_all(self):
-        self.sel.update(self.media)
+        self.sel.update(self.visible()[:self.limit])
         self.draw()
 
     def clear_sel(self):
@@ -1869,68 +2537,26 @@ class ImportScreen(Screen):
 
     def toggle_move(self):
         self.move = not self.move
-        if self.move:
-            self.move_btn.text = "Move: ON"
-            self.move_btn.set_bg(RED)
-        else:
-            self.move_btn.text = "Move: OFF"
-            self.move_btn.set_bg(CARD)
+        self.move_btn.text = "Move: ON" if self.move else "Move: OFF"
+        self.move_btn.set_bg(RED if self.move else CARD)
 
-    def import_selected(self):
-        files = [f for f in sorted(self.sel) if os.path.isfile(f)]
+    def do_import(self):
+        files = [p for p in self.items if p in self.sel and os.path.isfile(p)]
         if not files:
-            info("Select karein", "Pehle photos/videos tap karke select karein.")
+            info("Select files", "Tap the photos/videos you want to import.", .28)
             return
-        self.run_import(files)
-
-    def import_folder(self):
-        files = list(self.media)
-        if not files:
-            info("Khali folder", "Is folder mein photo/video nahi hai.")
-            return
-        ask("Import Folder", f"Is folder ki {len(files)} files\nimport karein?",
-            lambda: self.run_import(files))
-
-    def run_import(self, files):
         app = App.get_running_app()
-        move, total, key = self.move, len(files), app.store.key
-        lbl = Label(text=f"Importing 0/{total}", halign="center")
-        pop = popup("Encrypt + Import ho raha hai...", lbl, (.8, .25), auto_dismiss=False)
-        pop.open()
-        app.busy = True
-
-        def finish(ok, err):
-            pop.dismiss()
-            app.busy = False
-            app.last = time.time()
-            self.sel.clear()
-            msg = f"{ok}/{total} files vault mein add ho gayi!"
-            if ok < total and err:
-                msg += "\nError: " + err[:120]
-            info("Done", msg, .35)
-            app.show_gallery()
-
-        def work():
-            ok, last_err = 0, ""
-            for i, p in enumerate(files):
-                e = app.store.add_one(p, i, move, key)
-                if e is None:
-                    ok += 1
-                else:
-                    last_err = e
-                Clock.schedule_once(
-                    lambda dt, i=i: setattr(lbl, "text", f"Importing {i + 1}/{total}"))
-            Clock.schedule_once(lambda dt: finish(ok, last_err))
-
-        threading.Thread(target=work, daemon=True).start()
+        self.sel.clear()
+        app.run_import(files, app.current_album, uri=False, move=self.move)
 
 
 # ---------------- App ----------------
 class VaultApp(App):
     current_album = None
-    kind = "all"
+    kind = "photo"
     gen = 0
     busy = False
+    external = False
     last = 0
 
     def build(self):
@@ -1938,20 +2564,35 @@ class VaultApp(App):
         base = os.path.join(self.user_data_dir, "vault")
         os.makedirs(base, exist_ok=True)
         self.store = Store(base, os.path.join(self.user_data_dir, "vault_cache"))
+        clear_play_dir()
+        apply_theme(self.store.cfg.get("theme", "light"), self.store.cfg.get("scheme", 0))
         self.thumb_q = queue.Queue()
         for _ in range(2):
             threading.Thread(target=self.thumb_worker, daemon=True).start()
         self.last = time.time()
         self.sm = ScreenManager(transition=SlideTransition(duration=.2))
-        for cls, name in [(PinScreen, "pin"), (GalleryScreen, "gallery"),
-                          (ViewerScreen, "viewer"), (AlbumsScreen, "albums"),
-                          (ImportScreen, "import"), (SettingsScreen, "settings"),
-                          (ChangePinScreen, "changepin")]:
-            self.sm.add_widget(cls(name=name))
-        self.sm.current = "pin"
+        self.build_screens("pin")
         Window.bind(on_keyboard=self.on_key, on_touch_down=self.touched)
         Clock.schedule_interval(self.tick, 1)
         return self.sm
+
+    def build_screens(self, cur):
+        tr = self.sm.transition
+        self.sm.transition = NoTransition()
+        self.sm.clear_widgets()
+        for cls, name in [(PinScreen, "pin"), (HomeScreen, "home"), (FolderScreen, "folder"),
+                          (ViewerScreen, "viewer"), (ImportScreen, "import"),
+                          (SettingsScreen, "settings"), (ChangePinScreen, "changepin"),
+                          (ThemeScreen, "theme"), (FolderStyleScreen, "folderstyle"),
+                          (LanguageScreen, "language"), (TrashScreen, "trash")]:
+            self.sm.add_widget(cls(name=name))
+        self.sm.current = cur
+        self.sm.transition = tr
+
+    def restyle(self, cur):
+        """Re-applies theme colours by rebuilding all screens."""
+        apply_theme(self.store.cfg.get("theme", "light"), self.store.cfg.get("scheme", 0))
+        self.build_screens(cur)
 
     def on_start(self):
         ask_android_permissions()
@@ -1960,13 +2601,15 @@ class VaultApp(App):
     def go(self, name):
         self.sm.current = name
 
-    def show_gallery(self):
-        """Gallery tab: sab media dikhata hai (album filter hata deta hai)."""
-        self.current_album = None
-        if self.sm.current == "gallery":
-            self.sm.get_screen("gallery").refresh()
+    def open_folder(self, album):
+        self.current_album = album
+        self.go("folder")
+
+    def show_folder(self):
+        if self.sm.current == "folder":
+            self.sm.get_screen("folder").refresh()
         else:
-            self.go("gallery")
+            self.go("folder")
 
     def open_viewer(self, names, i):
         self.sm.get_screen("viewer").show(list(names), i)
@@ -1982,24 +2625,154 @@ class VaultApp(App):
                 p = self.store.thumb_cached(name, key)
             except Exception:
                 continue
+            if not p:
+                continue
             Clock.schedule_once(lambda dt, w=w, p=p, gen=gen: self.set_thumb(gen, w, p))
 
     def set_thumb(self, gen, w, p):
         if gen == self.gen and self.store.key is not None:
             w.source = p
 
+    # ----- import: phone gallery -> vault folder -----
+    def start_pick(self, album, kind):
+        """Opens the device gallery. After selecting, an 'Import +' button imports directly."""
+        if self.store.key is None:
+            return
+        self.busy = True
+
+        def got(uris):
+            Clock.schedule_once(lambda dt: self._picked(uris, album))
+
+        if open_gallery_picker(got, kind):
+            return
+        self.busy = False
+        self.go("import")  # fallback browser
+
+    def _picked(self, uris, album):
+        self.last = time.time()
+        if not uris or self.store.key is None:
+            self.busy = False
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+        lbl = Label(text=f"{len(uris)} file(s) selected", halign="center", font_size=dp(16))
+        box.add_widget(lbl)
+        pop = popup("Import", box, (.85, .3), auto_dismiss=False)
+
+        def cancel():
+            pop.dismiss()
+            self.busy = False
+
+        def go():
+            pop.dismiss()
+            self.run_import(uris, album, uri=True)
+        row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(52))
+        row.add_widget(btn("Cancel", cancel, SOFT))
+        row.add_widget(btn("Import  +", go, GREEN))
+        box.add_widget(row)
+        pop.open()
+
+    def run_import(self, items, album, uri=False, move=False):
+        key, total = self.store.key, len(items)
+        if key is None or not total:
+            self.busy = False
+            return
+        tmpdir = os.path.join(self.user_data_dir, "tmp_import")
+        lbl = Label(text=f"Importing 0/{total}", halign="center")
+        pop = popup("Encrypting + importing...", lbl, (.8, .25), auto_dismiss=False)
+        pop.open()
+        self.busy = True
+
+        def finish(ok, err):
+            pop.dismiss()
+            self.busy = False
+            self.last = time.time()
+            msg = f"{ok}/{total} files added to the vault!"
+            if ok and uri:
+                msg += ("\n\nOriginals are still in your Gallery. Once you have checked them "
+                        "in the vault, delete them from the Gallery yourself.")
+            if ok < total and err:
+                msg += "\nError: " + err[:120]
+            info("Done", msg, .5 if uri else .35)
+            self.show_folder()
+
+        def work():
+            ok, last_err, names = 0, "", []
+            for i, it in enumerate(items):
+                tmp = None
+                try:
+                    tmp = copy_uri_to_file(it, tmpdir, i) if uri else it
+                    nm, e = self.store.add_one(tmp, i, uri or move, key)
+                except Exception as ex:
+                    nm, e = None, str(ex)
+                if nm:
+                    ok += 1
+                    names.append(nm)
+                else:
+                    last_err = e or ""
+                    if uri and tmp:
+                        _rm(tmp)
+                Clock.schedule_once(
+                    lambda dt, i=i: setattr(lbl, "text", f"Importing {i + 1}/{total}"))
+            if album and names:
+                try:
+                    self.store.add_many_to_album(album, names)
+                except Exception:
+                    pass
+            Clock.schedule_once(lambda dt: finish(ok, last_err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ----- unhide: vault -> phone gallery -----
+    def unhide(self, names, after):
+        key = self.store.key
+        lbl = Label(text="Unhiding...", halign="center")
+        pop = popup("Unhide", lbl, (.8, .25), auto_dismiss=False)
+        pop.open()
+        self.busy = True
+
+        def done(ok, err):
+            pop.dismiss()
+            self.busy = False
+            self.last = time.time()
+            if ok:
+                info("Done", f"{ok} file(s) are back in the Gallery (VaultRestored folder) "
+                     "and removed from the vault.\nThey may take a moment to show up.", .4)
+            if err:
+                info("Unhide failed", err[:150], .35)
+            after()
+
+        def work():
+            ok, err = 0, ""
+            for i, n in enumerate(names):
+                try:
+                    self.store.restore_file(n, key)
+                    self.store.delete(n)
+                    ok += 1
+                except Exception as e:
+                    err = str(e)
+                Clock.schedule_once(
+                    lambda dt, i=i: setattr(lbl, "text", f"Unhiding {i + 1}/{len(names)}"))
+            Clock.schedule_once(lambda dt: done(ok, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ----- lock / unlock -----
     def after_unlock(self):
         self.last = time.time()
+        try:
+            self.store.purge_trash()
+        except Exception:
+            pass
+        self.kind = "photo"
         if self.store.plain_files():
             self.migrate()
         else:
-            self.go("gallery")
+            self.go("home")
 
     def migrate(self):
         st = self.store
         self.busy = True
-        lbl = Label(text="Purani files encrypt ho rahi hain...", halign="center")
+        lbl = Label(text="Encrypting old files...", halign="center")
         pop = popup("Encrypting...", lbl, (.8, .25), auto_dismiss=False)
         pop.open()
 
@@ -2007,7 +2780,7 @@ class VaultApp(App):
             pop.dismiss()
             self.busy = False
             self.last = time.time()
-            self.go("gallery")
+            self.go("home")
 
         def cb(i, n):
             Clock.schedule_once(lambda dt: setattr(lbl, "text", f"Encrypting {i}/{n}"))
@@ -2018,27 +2791,22 @@ class VaultApp(App):
             except Exception:
                 pass
             Clock.schedule_once(done)
+
         threading.Thread(target=work, daemon=True).start()
 
     def lock(self):
-        st = self.store
-        if st.key is None:
-            return
-        st.key = None
-        self.current_album = None
+        """Locks the vault: forgets the key, clears decrypted cache, shows the PIN screen."""
+        try:
+            self.sm.get_screen("viewer").stop_video()
+        except Exception:
+            pass
         self.gen += 1
-        v = self.sm.get_screen("viewer")
-        v.tok += 1
-        v.stop_video()
-        v.stage.clear_widgets()
-        self.sm.get_screen("gallery").grid.clear_widgets()
-        self.sm.get_screen("albums").grid.clear_widgets()
-        for c in ("kv.image", "kv.texture"):
-            try:
-                Cache.remove(c)
-            except Exception:
-                pass
-        st.clear_cache()
+        self.store.key = None
+        self.store.clear_cache()
+        clear_play_dir()
+        self.current_album = None
+        self.busy = False
+        self.external = False
         self.go("pin")
 
     def touched(self, *a):
@@ -2046,45 +2814,44 @@ class VaultApp(App):
         return False
 
     def tick(self, dt):
-        st = self.store
-        al = st.cfg.get("autolock", 60)
-        if st.key is None or al <= 0 or self.busy:
+        if self.store.key is None or self.busy:
             return
-        if self.sm.current == "viewer":
-            v = self.sm.get_screen("viewer")
-            if v.vid is not None and v.vid.state == "play":
-                self.last = time.time()
-                return
-        if time.time() - self.last > al:
+        sec = self.store.cfg.get("autolock", 60)
+        if sec and time.time() - self.last > sec:
             self.lock()
 
     def on_pause(self):
-        if not self.busy:
-            self.lock()
         return True
 
     def on_resume(self):
+        # coming back from the phone's video player
+        if self.external:
+            self.external = False
+            self.busy = False
         self.last = time.time()
 
-    def on_stop(self):
-        self.store.clear_cache()
-
     def on_key(self, win, key, *a):
-        if key != 27:
+        if key != 27:  # Back button
             return False
+        if self.busy:
+            return True
         cur = self.sm.current
         if cur == "pin":
             return False
-        if cur == "gallery":
-            if self.current_album:
-                self.current_album = None
-                self.sm.get_screen("gallery").refresh()
-            else:
-                self.lock()
+        if cur == "home":
+            self.lock()
+        elif cur == "folder":
+            self.sm.get_screen("folder").back()
+        elif cur == "viewer":
+            self.go("folder")
+        elif cur == "import":
+            self.show_folder()
         elif cur == "changepin":
             self.go("settings")
-        else:
-            self.go("gallery")
+        elif cur in ("settings", "folderstyle"):
+            self.go("home")
+        elif cur in ("theme", "language", "trash"):
+            self.go("settings")
         return True
 
 
