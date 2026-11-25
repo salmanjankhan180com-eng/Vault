@@ -1,4 +1,4 @@
-import os, json, hashlib, time, threading, queue
+import os, json, hashlib, time, threading, queue, shutil, zipfile, base64, mimetypes
 from kivy.app import App
 from kivy.cache import Cache
 from kivy.clock import Clock
@@ -53,6 +53,195 @@ def ask_android_permissions():
         ])
     except Exception:
         pass
+
+
+PICK_CODE = 7701
+MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+            "image/gif": ".gif", "image/bmp": ".bmp", "video/mp4": ".mp4",
+            "video/x-matroska": ".mkv", "video/3gpp": ".3gp", "video/quicktime": ".mov",
+            "video/x-msvideo": ".avi", "video/webm": ".webm"}
+
+
+def open_gallery_picker(on_result):
+    """Phone ka apna Gallery/Photo picker kholta hai (storage permission ki zarurat nahi).
+    Chalu ho gaya to True, nahi to False (tab purana folder browser chalega).
+    on_result(list_of_uri_strings) jab user select karke wapas aaye."""
+    try:
+        from android import activity
+        from jnius import autoclass
+        Intent = autoclass("android.content.Intent")
+        Build = autoclass("android.os.Build$VERSION")
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+
+        if Build.SDK_INT >= 33:
+            MediaStore = autoclass("android.provider.MediaStore")
+            it = Intent("android.provider.action.PICK_IMAGES")
+            it.putExtra("android.provider.extra.PICK_IMAGES_MAX",
+                        int(MediaStore.getPickImagesMaxLimit()))
+        else:
+            it = Intent(Intent.ACTION_GET_CONTENT)
+            it.setType("*/*")
+            it.addCategory(Intent.CATEGORY_OPENABLE)
+            it.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
+            try:
+                it.putExtra(Intent.EXTRA_MIME_TYPES, ["image/*", "video/*"])
+            except Exception:
+                it.setType("image/*")
+
+        def cb(req, res, data):
+            if req != PICK_CODE:
+                return
+            try:
+                activity.unbind(on_activity_result=cb)
+            except Exception:
+                pass
+            uris = []
+            try:
+                if res == -1 and data is not None:  # RESULT_OK
+                    clip = data.getClipData()
+                    if clip is not None:
+                        for i in range(clip.getItemCount()):
+                            uris.append(str(clip.getItemAt(i).getUri().toString()))
+                    elif data.getData() is not None:
+                        uris.append(str(data.getData().toString()))
+            except Exception:
+                uris = []
+            on_result(uris)
+
+        activity.bind(on_activity_result=cb)
+        act.startActivityForResult(it, PICK_CODE)
+        return True
+    except Exception:
+        return False
+
+
+def copy_uri_to_file(uri_str, dst_dir, i):
+    """Gallery wali file ko app ke temp folder mein copy karta hai, path return karta hai."""
+    from jnius import autoclass
+    Uri = autoclass("android.net.Uri")
+    act = autoclass("org.kivy.android.PythonActivity").mActivity
+    cr = act.getContentResolver()
+    uri = Uri.parse(uri_str)
+    mime = str(cr.getType(uri) or "").lower()
+    ext = MIME_EXT.get(mime) or (".mp4" if mime.startswith("video") else ".jpg")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, f"pick_{int(time.time() * 1000)}_{i}{ext}")
+    pfd = cr.openFileDescriptor(uri, "r")
+    fd = pfd.detachFd()
+    try:
+        with os.fdopen(fd, "rb") as fi, open(dst, "wb") as fo:
+            shutil.copyfileobj(fi, fo, 1 << 20)
+    except Exception:
+        _rm(dst)
+        raise
+    return dst
+
+
+BACKUP_CODE, OPEN_CODE = 7702, 7703
+
+
+def android_document(action, code, on_result, filename=None):
+    """Android ka file-picker kholta hai. action: 'create' (save karna) ya 'open' (file chunna).
+    on_result(uri_string ya None). Chalu ho gaya to True, warna False."""
+    try:
+        from android import activity
+        from jnius import autoclass
+        Intent = autoclass("android.content.Intent")
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        if action == "create":
+            it = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            it.setType("application/zip")
+            it.putExtra(Intent.EXTRA_TITLE, filename or "VaultBackup.zip")
+        else:
+            it = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            it.setType("*/*")
+        it.addCategory(Intent.CATEGORY_OPENABLE)
+
+        def cb(req, res, data):
+            if req != code:
+                return
+            try:
+                activity.unbind(on_activity_result=cb)
+            except Exception:
+                pass
+            uri = None
+            try:
+                if res == -1 and data is not None and data.getData() is not None:
+                    uri = str(data.getData().toString())
+            except Exception:
+                uri = None
+            on_result(uri)
+
+        activity.bind(on_activity_result=cb)
+        act.startActivityForResult(it, code)
+        return True
+    except Exception:
+        return False
+
+
+def copy_path_to_uri(src, uri_str):
+    """App ki file ko user ke chune hue Android document (Drive/Downloads) mein likhta hai."""
+    from jnius import autoclass
+    Uri = autoclass("android.net.Uri")
+    cr = autoclass("org.kivy.android.PythonActivity").mActivity.getContentResolver()
+    pfd = cr.openFileDescriptor(Uri.parse(uri_str), "w")
+    fd = pfd.detachFd()
+    with os.fdopen(fd, "wb") as fo, open(src, "rb") as fi:
+        shutil.copyfileobj(fi, fo, 1 << 20)
+
+
+def copy_uri_to_path(uri_str, dst):
+    """User ke chune hue Android document ko app ke temp path par copy karta hai."""
+    from jnius import autoclass
+    Uri = autoclass("android.net.Uri")
+    cr = autoclass("org.kivy.android.PythonActivity").mActivity.getContentResolver()
+    pfd = cr.openFileDescriptor(Uri.parse(uri_str), "r")
+    fd = pfd.detachFd()
+    try:
+        with os.fdopen(fd, "rb") as fi, open(dst, "wb") as fo:
+            shutil.copyfileobj(fi, fo, 1 << 20)
+    except Exception:
+        _rm(dst)
+        raise
+
+
+def export_to_gallery(src, fname):
+    """Decrypted file ko Gallery mein wapas rakhta hai. Pehle Android MediaStore (Android 10+),
+    na chale to seedha folder (Pictures/VaultRestored). Jagah ka naam return karta hai."""
+    try:
+        from jnius import autoclass
+        Build = autoclass("android.os.Build$VERSION")
+        if Build.SDK_INT >= 29:
+            ContentValues = autoclass("android.content.ContentValues")
+            cr = autoclass("org.kivy.android.PythonActivity").mActivity.getContentResolver()
+            vid = is_video(fname)
+            mime = mimetypes.guess_type(fname)[0] or ("video/mp4" if vid else "image/jpeg")
+            rel = ("Movies" if vid else "Pictures") + "/VaultRestored"
+            vals = ContentValues()
+            vals.put("_display_name", fname)
+            vals.put("mime_type", mime)
+            vals.put("relative_path", rel)
+            coll = autoclass("android.provider.MediaStore$Video$Media" if vid
+                             else "android.provider.MediaStore$Images$Media").EXTERNAL_CONTENT_URI
+            uri = cr.insert(coll, vals)
+            if uri is None:
+                raise Exception("MediaStore insert nahi hua")
+            pfd = cr.openFileDescriptor(uri, "w")
+            fd = pfd.detachFd()
+            with os.fdopen(fd, "wb") as fo, open(src, "rb") as fi:
+                shutil.copyfileobj(fi, fo, 1 << 20)
+            return rel + "/" + fname
+    except Exception:
+        pass
+    os.makedirs(RESTORE_DIR, exist_ok=True)
+    stem, ext = os.path.splitext(fname)
+    dest = os.path.join(RESTORE_DIR, stem + ext)
+    n = 1
+    while os.path.exists(dest):
+        dest = os.path.join(RESTORE_DIR, f"{stem}_{n}{ext}")
+        n += 1
+    shutil.copyfile(src, dest)
+    return dest
 
 
 def base_name(n):
@@ -158,6 +347,111 @@ class Store:
         self.cfg["wrapped"] = _xor_bytes(master, self._mask(pk)).hex()
         self.save()
 
+    # ----- recovery key / backup / import -----
+    def recovery_key(self):
+        """Master key ko padhne layak code mein deta hai (vault khula hona chahiye)."""
+        if self.key is None:
+            raise Exception("Vault locked")
+        s = base64.b32encode(self.key).decode().rstrip("=")
+        return "-".join(s[i:i + 4] for i in range(0, len(s), 4))
+
+    @staticmethod
+    def parse_recovery_key(text):
+        s = "".join(c for c in (text or "").upper() if c.isalnum())
+        try:
+            s += "=" * (-len(s) % 8)
+            m = base64.b32decode(s)
+        except Exception:
+            return None
+        return m if len(m) == 32 else None
+
+    def master_ok(self, master, cfg=None):
+        cfg = cfg if cfg is not None else self.cfg
+        return bool(master) and "check" in cfg and \
+            hashlib.sha256(master).hexdigest() == cfg["check"]
+
+    def recover_with_key(self, master, newpin):
+        """PIN bhool gaye: Recovery Key se vault kholkar naya PIN set karta hai."""
+        if not self.has_keys() or not self.master_ok(master):
+            return False
+        self.rewrap(master, newpin)
+        self.key = master
+        self.cfg["fails"], self.cfg["lock_until"] = 0, 0
+        self.save()
+        return True
+
+    def make_backup(self, dest, cb=None):
+        """Encrypted files + albums ki ek zip banata hai. PIN wali key zip mein NAHI jaati,
+        isliye zip sirf Recovery Key se hi khul sakti hai."""
+        names = [f for f in os.listdir(self.media) if f.endswith(".vault")]
+        meta = {"v": 1, "check": self.cfg.get("check"),
+                "albums": self.cfg.get("albums", {}),
+                "autolock": self.cfg.get("autolock", 60)}
+        tmp = dest + ".part"
+        try:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+                z.writestr("config.json", json.dumps(meta))
+                for i, n in enumerate(names):
+                    z.write(os.path.join(self.media, n), "media/" + n)
+                    if cb:
+                        cb(i + 1, len(names))
+            os.replace(tmp, dest)
+        except Exception:
+            _rm(tmp)
+            raise
+        return len(names)
+
+    @staticmethod
+    def read_backup(zpath):
+        try:
+            with zipfile.ZipFile(zpath) as z:
+                meta = json.loads(z.read("config.json").decode())
+                names = [n[6:] for n in z.namelist()
+                         if n.startswith("media/") and n.endswith(".vault")]
+            if not isinstance(meta, dict) or "check" not in meta:
+                raise ValueError("no check")
+        except Exception:
+            raise Exception("Ye Vault ka backup nahi hai")
+        return meta, names
+
+    def import_backup(self, zpath, master, newpin, cb=None):
+        """Backup zip ko khali vault mein wapas laata hai, naye PIN ke saath."""
+        meta, names = self.read_backup(zpath)
+        if not self.master_ok(master, meta):
+            raise Exception("Recovery Key galat hai")
+        if self.media_list() or self.plain_files():
+            raise Exception("Import sirf khali vault mein ho sakta hai")
+        copied = []
+        try:
+            with zipfile.ZipFile(zpath) as z:
+                for i, n in enumerate(names):
+                    if os.path.basename(n) != n or n.startswith("."):
+                        continue
+                    dst = os.path.join(self.media, n)
+                    tmp = dst + ".part"
+                    try:
+                        with z.open("media/" + n) as fi, open(tmp, "wb") as fo:
+                            shutil.copyfileobj(fi, fo, 1 << 20)
+                        os.replace(tmp, dst)
+                    except Exception:
+                        _rm(tmp)
+                        raise
+                    copied.append(dst)
+                    if cb:
+                        cb(i + 1, len(names))
+        except Exception:
+            for d in copied:
+                _rm(d)
+            raise
+        have = set(os.listdir(self.media))
+        albums = meta.get("albums", {})
+        self.cfg["albums"] = {a: [x for x in lst if x in have]
+                              for a, lst in albums.items() if isinstance(lst, list)}
+        self.cfg["autolock"] = meta.get("autolock", 60)
+        self.cfg["fails"], self.cfg["lock_until"] = 0, 0
+        self.setup_keys(newpin, master)
+        return len(copied)
+
     # ----- encrypt / decrypt -----
     def encrypt_file(self, src, dst, key=None):
         key = key or self.key
@@ -261,15 +555,13 @@ class Store:
         return result
 
     def restore_file(self, name, key):
-        os.makedirs(RESTORE_DIR, exist_ok=True)
-        stem, ext = os.path.splitext(base_name(name))
-        dest = os.path.join(RESTORE_DIR, stem + ext)
-        n = 1
-        while os.path.exists(dest):
-            dest = os.path.join(RESTORE_DIR, f"{stem}_{n}{ext}")
-            n += 1
-        self.decrypt_file(os.path.join(self.media, name), dest, key)
-        return dest
+        fname = base_name(name)
+        tmp = os.path.join(self.cache, f"restore_{threading.get_ident()}_{fname}")
+        self.decrypt_file(os.path.join(self.media, name), tmp, key)
+        try:
+            return export_to_gallery(tmp, fname)
+        finally:
+            _rm(tmp)
 
     def clear_cache(self):
         try:
@@ -559,6 +851,38 @@ def new_album_popup(after):
     pop.open()
 
 
+def recovery_popup(after):
+    """PIN bhool gaye: Recovery Key + naya PIN."""
+    app = App.get_running_app()
+    st = app.store
+    box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+    k = TextInput(hint_text="Recovery Key paste karein", multiline=False,
+                  size_hint_y=None, height=dp(46))
+    p = TextInput(hint_text="Naya 4-digit PIN", multiline=False, input_filter="int",
+                  password=True, size_hint_y=None, height=dp(46))
+    msg = Label(color=hx("#FF6B6B"), size_hint_y=None, height=dp(24), font_size=dp(13))
+    for w in (k, p, msg):
+        box.add_widget(w)
+    pop = popup("Recovery Key se kholein", box, (.92, .5))
+
+    def ok():
+        pin = p.text.strip()
+        if len(pin) != 4 or not pin.isdigit():
+            msg.text = "PIN 4 ank ka hona chahiye"
+            return
+        m = st.parse_recovery_key(k.text)
+        if m is None or not st.recover_with_key(m, pin):
+            msg.text = "Recovery Key galat hai"
+            return
+        pop.dismiss()
+        after()
+    row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(48))
+    row.add_widget(btn("Cancel", pop.dismiss, SOFT))
+    row.add_widget(btn("Kholein", ok, GREEN))
+    box.add_widget(row)
+    pop.open()
+
+
 # ---------------- PIN keypad widget ----------------
 class PinPad(BoxLayout):
     def __init__(self, on_pin, **kw):
@@ -614,7 +938,19 @@ class PinScreen(Screen):
         super().__init__(**kw)
         self.mode, self.first = "unlock", ""
         self.pad = PinPad(self.on_pin)
-        self.add_widget(self.pad)
+        root = BoxLayout(orientation="vertical", padding=(0, 0, 0, dp(8)))
+        root.add_widget(self.pad)
+        bx = BoxLayout(size_hint_y=None, height=dp(48), padding=(dp(20), 0))
+        bx.add_widget(btn("PIN bhool gaye? Recovery Key", self.forgot, SOFT, font_size=dp(13)))
+        root.add_widget(bx)
+        self.add_widget(root)
+
+    def forgot(self):
+        app = App.get_running_app()
+        if not app.store.has_keys():
+            info("Recovery Key", "Abhi vault ki key nahi bani hai.\nPehle PIN banayein.", .3)
+            return
+        recovery_popup(app.after_unlock)
 
     def on_pre_enter(self, *a):
         st = App.get_running_app().store
@@ -731,13 +1067,19 @@ class SettingsScreen(Screen):
             row.add_widget(b)
         body.add_widget(row)
         body.add_widget(btn("Change PIN", lambda: app.go("changepin"), ACCENT,
-                            size_hint_y=None, height=dp(52)))
+                            size_hint_y=None, height=dp(48)))
+        body.add_widget(btn("Recovery Key dikhayein", self.show_key, GREEN,
+                            size_hint_y=None, height=dp(48)))
+        body.add_widget(btn("Backup banayein (Drive/Downloads)", self.backup, SOFT,
+                            size_hint_y=None, height=dp(48)))
+        body.add_widget(btn("Backup se Import karein", self.import_backup, SOFT,
+                            size_hint_y=None, height=dp(48)))
         note = Label(
             text=("Dhyan dein:\n"
-                  "- PIN bhool gaye to files wapas nahi aa sakti.\n"
-                  "- App uninstall ya Pydroid ka data clear karne par vault aur key dono "
-                  "ud jaate hain. Zaroori files pehle Restore kar lein.\n"
-                  "- Restore ki hui files Pictures/VaultRestored mein jaati hain."),
+                  "- Recovery Key apne Gmail mein save kar lein. Iske bina PIN bhoolne par "
+                  "ya app uninstall hone par files wapas nahi aa sakti.\n"
+                  "- Backup file Drive mein rakhein. Wo sirf Recovery Key se khulti hai.\n"
+                  "- Restore ki hui files Gallery ke VaultRestored folder mein aati hain."),
             halign="left", valign="top", color=hx(MUTED), font_size=dp(13))
         note.bind(size=lambda w, s: setattr(w, "text_size", (s[0], s[1])))
         body.add_widget(note)
@@ -749,6 +1091,217 @@ class SettingsScreen(Screen):
         cur = App.get_running_app().store.cfg.get("autolock", 60)
         for sec, b in self.abtns.items():
             b.set_bg(ACCENT if sec == cur else CARD)
+
+    # ----- Recovery Key / Backup / Import -----
+    def show_key(self):
+        app = App.get_running_app()
+        try:
+            key = app.store.recovery_key()
+        except Exception as e:
+            info("Recovery Key", str(e), .3)
+            return
+        parts = key.split("-")
+        text = "\n".join("  ".join(parts[i:i + 3]) for i in range(0, len(parts), 3))
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        lbl = Label(text=text, font_size=dp(17), halign="center")
+        lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(lbl)
+        note = Label(text="Ise Gmail mein khud ko bhej kar ya Notes mein save karein.\n"
+                          "Kisi ko mat dein: isse poora vault khul sakta hai.",
+                     halign="center", color=hx(MUTED), font_size=dp(13),
+                     size_hint_y=None, height=dp(60))
+        note.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(note)
+        pop = popup("Recovery Key", box, (.94, .7))
+        row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(48))
+        holder = {}
+
+        def do_copy():
+            try:
+                from kivy.core.clipboard import Clipboard
+                Clipboard.copy(key)
+                holder["b"].text = "Copy ho gaya!"
+            except Exception:
+                holder["b"].text = "Copy nahi hua"
+
+        holder["b"] = btn("Copy", do_copy, ACCENT)
+        row.add_widget(holder["b"])
+        row.add_widget(btn("Band karein", pop.dismiss, SOFT))
+        box.add_widget(row)
+        pop.open()
+
+    def backup(self):
+        ask("Backup banayein",
+            "Backup file Recovery Key ke bina khul nahi sakti.\n"
+            "Pehle 'Recovery Key dikhayein' se key save kar lein.\n\nAage badhein?",
+            self._pick_backup_dest)
+
+    def _pick_backup_dest(self):
+        app = App.get_running_app()
+        fname = "VaultBackup_" + time.strftime("%Y%m%d") + ".zip"
+        app.busy = True  # picker khulne par app auto-lock na ho
+
+        def got(uri):
+            Clock.schedule_once(lambda dt: self._do_backup(uri))
+
+        if not android_document("create", BACKUP_CODE, got, fname):
+            app.busy = False
+            info("Backup", "Ye option sirf Android APK mein chalta hai.", .3)
+
+    def _do_backup(self, uri):
+        app = App.get_running_app()
+        app.last = time.time()
+        if not uri:
+            app.busy = False
+            return
+        lbl = Label(text="Backup ban raha hai...", halign="center")
+        pop = popup("Backup", lbl, (.8, .25), auto_dismiss=False)
+        pop.open()
+        tmp = os.path.join(app.user_data_dir, "backup_tmp.zip")
+
+        def prog(i, n):
+            Clock.schedule_once(lambda dt: setattr(lbl, "text", f"Backup {i}/{n}"))
+
+        def done(n, err):
+            pop.dismiss()
+            app.busy = False
+            app.last = time.time()
+            if err:
+                info("Backup fail", err[:150], .4)
+            elif n == 0:
+                info("Backup", "Vault abhi khali hai, backup mein koi file nahi gayi.", .3)
+            else:
+                info("Backup ho gaya", f"{n} files ka backup save ho gaya.\n"
+                     "Isse Google Drive mein rakhein, aur Recovery Key alag jagah.", .4)
+
+        def work():
+            err, n = None, 0
+            try:
+                n = app.store.make_backup(tmp, prog)
+                Clock.schedule_once(lambda dt: setattr(lbl, "text", "Save ho raha hai..."))
+                copy_path_to_uri(tmp, uri)
+            except Exception as e:
+                err = str(e)
+            _rm(tmp)
+            Clock.schedule_once(lambda dt: done(n, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def import_backup(self):
+        app = App.get_running_app()
+        if app.store.media_list():
+            info("Import", "Import sirf khali vault mein ho sakta hai.\n"
+                 "App nayi install karke PIN banayein, phir yahan import karein.", .4)
+            return
+        app.busy = True
+
+        def got(uri):
+            Clock.schedule_once(lambda dt: self._got_backup(uri))
+
+        if not android_document("open", OPEN_CODE, got):
+            app.busy = False
+            info("Import", "Ye option sirf Android APK mein chalta hai.", .3)
+
+    def _got_backup(self, uri):
+        app = App.get_running_app()
+        app.last = time.time()
+        if not uri:
+            app.busy = False
+            return
+        lbl = Label(text="Backup file padh raha hoon...", halign="center")
+        pop = popup("Import", lbl, (.8, .25), auto_dismiss=False)
+        pop.open()
+        tmp = os.path.join(app.user_data_dir, "import_tmp.zip")
+
+        def fail(err):
+            pop.dismiss()
+            app.busy = False
+            _rm(tmp)
+            info("Import fail", err[:150], .4)
+
+        def ready(n):
+            pop.dismiss()
+            self._ask_key(tmp, n)
+
+        def work():
+            try:
+                copy_uri_to_path(uri, tmp)
+                meta, names = app.store.read_backup(tmp)
+            except Exception as e:
+                msg = str(e)
+                Clock.schedule_once(lambda dt: fail(msg))
+                return
+            Clock.schedule_once(lambda dt: ready(len(names)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ask_key(self, tmp, count):
+        app = App.get_running_app()
+        st = app.store
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        box.add_widget(Label(text=f"Backup mein {count} files hain.", size_hint_y=None,
+                             height=dp(24), font_size=dp(14)))
+        k = TextInput(hint_text="Recovery Key paste karein", multiline=False,
+                      size_hint_y=None, height=dp(46))
+        p = TextInput(hint_text="Naya 4-digit PIN", multiline=False, input_filter="int",
+                      password=True, size_hint_y=None, height=dp(46))
+        msg = Label(color=hx("#FF6B6B"), size_hint_y=None, height=dp(24), font_size=dp(13))
+        for w in (k, p, msg):
+            box.add_widget(w)
+        pop = popup("Backup Import", box, (.92, .55), auto_dismiss=False)
+
+        def cancel():
+            pop.dismiss()
+            app.busy = False
+            _rm(tmp)
+
+        def go():
+            pin = p.text.strip()
+            if len(pin) != 4 or not pin.isdigit():
+                msg.text = "PIN 4 ank ka hona chahiye"
+                return
+            m = st.parse_recovery_key(k.text)
+            if m is None:
+                msg.text = "Recovery Key galat hai"
+                return
+            pop.dismiss()
+            self._run_import(tmp, m, pin)
+
+        row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(48))
+        row.add_widget(btn("Cancel", cancel, SOFT))
+        row.add_widget(btn("Import", go, GREEN))
+        box.add_widget(row)
+        pop.open()
+
+    def _run_import(self, tmp, master, pin):
+        app = App.get_running_app()
+        lbl = Label(text="Import ho raha hai...", halign="center")
+        pop = popup("Import", lbl, (.8, .25), auto_dismiss=False)
+        pop.open()
+
+        def prog(i, n):
+            Clock.schedule_once(lambda dt: setattr(lbl, "text", f"Import {i}/{n}"))
+
+        def done(n, err):
+            pop.dismiss()
+            app.busy = False
+            app.last = time.time()
+            _rm(tmp)
+            if err:
+                info("Import fail", err[:150], .4)
+                return
+            info("Import ho gaya", f"{n} files wapas aa gayi.\nAb aapka naya PIN chalega.", .4)
+            app.show_gallery()
+
+        def work():
+            n, err = 0, None
+            try:
+                n = app.store.import_backup(tmp, master, pin, prog)
+            except Exception as e:
+                err = str(e)
+            Clock.schedule_once(lambda dt: done(n, err))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def set_auto(self, sec):
         st = App.get_running_app().store
@@ -993,7 +1546,7 @@ class ViewerScreen(Screen):
                 if name in self.names:
                     self.names.remove(name)
                 info("Restore ho gayi",
-                     "File Pictures/VaultRestored mein hai aur vault se hat gayi.\n"
+                     "File Gallery mein (VaultRestored folder) wapas aa gayi aur vault se hat gayi.\n"
                      "Gallery mein dikhne mein thoda time lag sakta hai.", .4)
                 self.load()
 
@@ -1146,7 +1699,70 @@ class ImportScreen(Screen):
              "Photos and videos ALLOW karein, aur Special app access > "
              "All files access > Pydroid 3 ON karein. Phir Force stop karke dobara kholein.", .75)
 
+    def start_gallery_pick(self):
+        app = App.get_running_app()
+        if app.store.key is None:
+            return False
+        app.busy = True  # picker khulne par app auto-lock na ho
+
+        def got(uris):
+            Clock.schedule_once(lambda dt: self.picked(uris))
+
+        if open_gallery_picker(got):
+            return True
+        app.busy = False
+        return False
+
+    def picked(self, uris):
+        app = App.get_running_app()
+        app.last = time.time()
+        key = app.store.key
+        if not uris or key is None:
+            app.busy = False
+            app.go("gallery")
+            return
+        total = len(uris)
+        tmpdir = os.path.join(app.user_data_dir, "tmp_import")
+        lbl = Label(text=f"Importing 0/{total}", halign="center")
+        pop = popup("Encrypt + Import ho raha hai...", lbl, (.8, .25), auto_dismiss=False)
+        pop.open()
+
+        def finish(ok, err):
+            pop.dismiss()
+            app.busy = False
+            app.last = time.time()
+            msg = f"{ok}/{total} files vault mein add ho gayi!"
+            if ok:
+                msg += "\n\nAsli files Gallery mein abhi bhi hain. Vault mein dekh kar tasalli ho jaye to unhe Gallery se khud delete kar dein."
+            if ok < total and err:
+                msg += "\nError: " + err[:120]
+            info("Done", msg, .5)
+            app.show_gallery()
+
+        def work():
+            ok, last_err = 0, ""
+            for i, u in enumerate(uris):
+                tmp = None
+                try:
+                    tmp = copy_uri_to_file(u, tmpdir, i)
+                    e = app.store.add_one(tmp, i, True, key)
+                except Exception as ex:
+                    e = str(ex)
+                if e is None:
+                    ok += 1
+                else:
+                    last_err = e
+                    if tmp:
+                        _rm(tmp)
+                Clock.schedule_once(
+                    lambda dt, i=i: setattr(lbl, "text", f"Importing {i + 1}/{total}"))
+            Clock.schedule_once(lambda dt: finish(ok, last_err))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def on_pre_enter(self, *a):
+        if self.start_gallery_pick():
+            return
         start = self.path if os.path.exists(self.path) else ROOT
         if not os.path.exists(start):
             start = os.path.expanduser("~")
