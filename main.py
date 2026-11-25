@@ -1,4 +1,4 @@
-import os, json, hashlib, time, threading, queue, shutil, zipfile, base64, mimetypes, subprocess
+import os, json, hashlib, time, threading, queue, shutil, zipfile, base64, mimetypes, subprocess, math
 try:
     import ffpyplayer  # noqa: F401
     os.environ.setdefault("KIVY_VIDEO", "ffpyplayer")
@@ -9,7 +9,7 @@ from kivy.app import App
 from kivy.cache import Cache
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.graphics import Color, RoundedRectangle, Rectangle, Ellipse, Line, Triangle
+from kivy.graphics import Color, RoundedRectangle, Rectangle, Ellipse, Line, Triangle, Mesh
 from kivy.metrics import dp
 from kivy.utils import get_color_from_hex as hx
 from kivy.uix.boxlayout import BoxLayout
@@ -201,6 +201,99 @@ def copy_uri_to_file(uri_str, dst_dir, i):
         _rm(dst)
         raise
     return dst
+
+
+DELETE_CODE = 7704
+
+
+def _media_uri(uri_str):
+    """Converts a picker / document uri into a MediaStore uri (None if not possible)."""
+    from jnius import autoclass
+    Uri = autoclass("android.net.Uri")
+    ContentUris = autoclass("android.content.ContentUris")
+    cr = autoclass("org.kivy.android.PythonActivity").mActivity.getContentResolver()
+    u = Uri.parse(uri_str)
+    auth = str(u.getAuthority() or "")
+    path = str(u.getPath() or "")
+    seg = str(u.getLastPathSegment() or "")
+    vid = str(cr.getType(u) or "").lower().startswith("video")
+    mid = None
+    if auth == "media":
+        if "picker" in path:
+            mid = seg
+        elif "/media/" in path:
+            return u
+    elif auth == "com.android.providers.media.documents" and ":" in seg:
+        kind, mid = seg.split(":", 1)
+        vid = kind == "video"
+    if not mid or not str(mid).isdigit():
+        return None
+    coll = autoclass("android.provider.MediaStore$Video$Media" if vid
+                     else "android.provider.MediaStore$Images$Media").EXTERNAL_CONTENT_URI
+    return ContentUris.withAppendedId(coll, int(mid))
+
+
+def delete_from_gallery(uris, on_done):
+    """Deletes the original files from the phone Gallery after they were imported.
+    Android 11+ shows its own 'Allow to delete?' box once. on_done(True/False).
+    Returns False if it could not even start."""
+    try:
+        from android import activity
+        from jnius import autoclass
+        Build = autoclass("android.os.Build$VERSION")
+        MediaStore = autoclass("android.provider.MediaStore")
+        ArrayList = autoclass("java.util.ArrayList")
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        cr = act.getContentResolver()
+        murs = []
+        for u in uris:
+            try:
+                m = _media_uri(u)
+                if m is not None:
+                    murs.append(m)
+            except Exception:
+                pass
+        if not murs:
+            return False
+        if Build.SDK_INT >= 30:
+            lst = ArrayList()
+            for m in murs:
+                lst.add(m)
+            pi = MediaStore.createDeleteRequest(cr, lst)
+
+            def cb(req, res, data):
+                if req != DELETE_CODE:
+                    return
+                try:
+                    activity.unbind(on_activity_result=cb)
+                except Exception:
+                    pass
+                on_done(res == -1)
+
+            activity.bind(on_activity_result=cb)
+            act.startIntentSenderForResult(pi.getIntentSender(), DELETE_CODE, None, 0, 0, 0)
+            return True
+        n = 0
+        for m in murs:
+            try:
+                n += int(cr.delete(m, None, None))
+            except Exception:
+                pass
+        on_done(n >= len(murs))
+        return True
+    except Exception:
+        return False
+
+
+def media_rescan(paths):
+    """Tells the Gallery that files were removed, so they stop showing."""
+    try:
+        from jnius import autoclass
+        MSC = autoclass("android.media.MediaScannerConnection")
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        MSC.scanFile(act, [str(p) for p in paths], None, None)
+    except Exception:
+        pass
 
 
 BACKUP_CODE, OPEN_CODE = 7702, 7703
@@ -1132,6 +1225,61 @@ def info(title, text, h=.3):
     lbl = Label(text=text, halign="center")
     lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
     pop = popup(title, lbl, (.88, h))
+    pop.open()
+    return pop
+
+
+class SealCheck(Widget):
+    """Green seal with a white tick."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.bind(pos=self.draw, size=self.draw)
+
+    def draw(self, *a):
+        self.canvas.clear()
+        s = min(self.width, self.height)
+        if s <= 0:
+            return
+        cx, cy, R = self.center_x, self.center_y, s / 2
+        n = 72
+        verts = [cx, cy, 0, 0]
+        for i in range(n + 1):
+            ang = 2 * math.pi * i / n
+            r = R * (0.9 + 0.1 * math.cos(12 * ang))
+            verts += [cx + r * math.cos(ang), cy + r * math.sin(ang), 0, 0]
+        with self.canvas:
+            Color(.13, .63, .17, 1)
+            Mesh(vertices=verts, indices=list(range(n + 2)), mode="triangle_fan")
+            Color(1, 1, 1, 1)
+            Line(points=[cx - R * .38, cy - R * .02, cx - R * .1, cy - R * .3,
+                         cx + R * .4, cy + R * .28],
+                 width=dp(3), cap="round", joint="round")
+
+
+def success_popup(text, extra="", on_done=None):
+    """Big 'imported successfully' box: green tick on top, text, Done button."""
+    box = BoxLayout(orientation="vertical", spacing=dp(14), padding=dp(18))
+    box.add_widget(SealCheck(size_hint_y=None, height=dp(84)))
+    lbl = Label(text=text, font_size=dp(18), bold=True, halign="center",
+                size_hint_y=None, height=dp(34))
+    lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+    box.add_widget(lbl)
+    h = dp(330)
+    if extra:
+        ex = Label(text=extra, font_size=dp(13), halign="center", color=hx(MUTED),
+                   size_hint_y=None, height=dp(58))
+        ex.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(ex)
+        h = dp(390)
+    pop = Popup(title="", separator_height=0, content=box, size_hint=(.88, None),
+                height=h, auto_dismiss=False, background="", background_color=hx(CARD))
+
+    def close():
+        pop.dismiss()
+        if on_done:
+            on_done()
+    box.add_widget(btn("Done", close, ACCENT, size_hint_y=None, height=dp(54), radius=27))
     pop.open()
     return pop
 
@@ -2373,7 +2521,7 @@ class ImportScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
         app = App.get_running_app()
-        self.move = False
+        self.move = True
         self.items, self.sel, self.tiles = [], set(), {}
         self.limit, self.filt, self.scan_id, self.gen = self.PAGE, "all", 0, 0
         root = BoxLayout(orientation="vertical")
@@ -2399,7 +2547,7 @@ class ImportScreen(Screen):
         row1 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6), padding=(dp(8), 0))
         row1.add_widget(btn("Select All", self.select_all))
         row1.add_widget(btn("Clear", self.clear_sel))
-        self.move_btn = btn("Move: OFF", self.toggle_move)
+        self.move_btn = btn("Move: ON", self.toggle_move, RED)
         row1.add_widget(self.move_btn)
         root.add_widget(row1)
         row2 = BoxLayout(size_hint_y=None, height=dp(60), padding=(dp(8), dp(6)))
@@ -2710,21 +2858,43 @@ class VaultApp(App):
         pop.open()
         self.busy = True
 
-        def finish(ok, err):
-            pop.dismiss()
+        def show_done(ok, err, names, declined):
             self.busy = False
             self.last = time.time()
-            msg = f"{ok}/{total} files added to the vault!"
-            if ok and uri:
-                msg += ("\n\nOriginals are still in your Gallery. Once you have checked them "
-                        "in the vault, delete them from the Gallery yourself.")
-            if ok < total and err:
-                msg += "\nError: " + err[:120]
-            info("Done", msg, .5 if uri else .35)
-            self.show_folder()
+            if not ok:
+                info("Import failed", ("Error: " + err[:120]) if err else "Nothing was imported.", .35)
+                self.show_folder()
+                return
+            vids = sum(1 for n in names if is_video(n))
+            if vids == len(names):
+                word = "video" if ok == 1 else "videos"
+            elif vids == 0:
+                word = "photo" if ok == 1 else "photos"
+            else:
+                word = "file" if ok == 1 else "files"
+            extra = []
+            if ok < total:
+                extra.append(f"{total - ok} failed. " + err[:80])
+            if declined:
+                extra.append("Originals are still in your Gallery\n(delete was not allowed).")
+            success_popup(f"{ok} {word} imported successfully", "\n".join(extra), self.show_folder)
+
+        def finish(ok, err, names, ok_uris, ok_paths):
+            pop.dismiss()
+            self.last = time.time()
+            if ok and uri and ok_uris:
+                # remove the originals from the phone Gallery (Android asks once)
+                def after_del(deleted):
+                    Clock.schedule_once(lambda dt: show_done(ok, err, names, not deleted))
+                if not delete_from_gallery(ok_uris, after_del):
+                    show_done(ok, err, names, True)
+                return
+            if ok_paths:
+                media_rescan(ok_paths)
+            show_done(ok, err, names, False)
 
         def work():
-            ok, last_err, names = 0, "", []
+            ok, last_err, names, ok_uris, ok_paths = 0, "", [], [], []
             for i, it in enumerate(items):
                 tmp = None
                 try:
@@ -2735,6 +2905,10 @@ class VaultApp(App):
                 if nm:
                     ok += 1
                     names.append(nm)
+                    if uri:
+                        ok_uris.append(it)
+                    elif move:
+                        ok_paths.append(it)
                 else:
                     last_err = e or ""
                     if uri and tmp:
@@ -2746,7 +2920,7 @@ class VaultApp(App):
                     self.store.add_many_to_album(album, names)
                 except Exception:
                     pass
-            Clock.schedule_once(lambda dt: finish(ok, last_err))
+            Clock.schedule_once(lambda dt: finish(ok, last_err, names, ok_uris, ok_paths))
 
         threading.Thread(target=work, daemon=True).start()
 
