@@ -115,11 +115,14 @@ MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
             "video/x-msvideo": ".avi", "video/webm": ".webm"}
 
 
-def open_gallery_picker(on_result, kind="photo"):
-    """Opens the phone's GALLERY (not the file manager).
-    Android 13+: system Photo picker (gallery style, multi-select).
-    Older Android: ACTION_PICK on MediaStore, which opens the Gallery / Photos app.
-    Returns True if it started, False otherwise (then the in-app browser is used)."""
+PICK_DBG = ""
+
+
+def open_gallery_picker(on_result, kind="photo", mode="gallery"):
+    """Opens the phone's gallery (mode='gallery') or the Files picker (mode='document').
+    Returns True if it started. PICK_DBG keeps a short reason when something fails."""
+    global PICK_DBG
+    PICK_DBG = ""
     try:
         from android import activity
         from jnius import autoclass
@@ -129,7 +132,12 @@ def open_gallery_picker(on_result, kind="photo"):
         act = autoclass("org.kivy.android.PythonActivity").mActivity
         mime = "video/*" if kind == "video" else "image/*"
 
-        if Build.SDK_INT >= 33:
+        if mode == "document":
+            it = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            it.setType(mime)
+            it.addCategory(Intent.CATEGORY_OPENABLE)
+            it.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
+        elif Build.SDK_INT >= 33:
             it = Intent("android.provider.action.PICK_IMAGES")
             it.setType(mime)
             it.putExtra("android.provider.extra.PICK_IMAGES_MAX",
@@ -144,6 +152,7 @@ def open_gallery_picker(on_result, kind="photo"):
             it.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
 
         def cb(req, res, data):
+            global PICK_DBG
             if req != PICK_CODE:
                 return
             try:
@@ -151,6 +160,7 @@ def open_gallery_picker(on_result, kind="photo"):
             except Exception:
                 pass
             uris = []
+            PICK_DBG = "result=%s data=%s" % (res, "yes" if data is not None else "no")
             try:
                 if res == -1 and data is not None:
                     clip = data.getClipData()
@@ -159,14 +169,16 @@ def open_gallery_picker(on_result, kind="photo"):
                             uris.append(str(clip.getItemAt(i).getUri().toString()))
                     elif data.getData() is not None:
                         uris.append(str(data.getData().toString()))
-            except Exception:
+            except Exception as e:
+                PICK_DBG += " read error: " + str(e)[:60]
                 uris = []
             on_result(uris)
 
         activity.bind(on_activity_result=cb)
         act.startActivityForResult(it, PICK_CODE)
         return True
-    except Exception:
+    except Exception as e:
+        PICK_DBG = "start error: " + str(e)[:100]
         return False
 
 
@@ -2634,24 +2646,40 @@ class VaultApp(App):
             w.source = p
 
     # ----- import: phone gallery -> vault folder -----
-    def start_pick(self, album, kind):
+    def start_pick(self, album, kind, mode="gallery"):
         """Opens the device gallery. After selecting, an 'Import +' button imports directly."""
         if self.store.key is None:
             return
         self.busy = True
 
         def got(uris):
-            Clock.schedule_once(lambda dt: self._picked(uris, album))
+            Clock.schedule_once(lambda dt: self._picked(uris, album, kind))
 
-        if open_gallery_picker(got, kind):
+        if open_gallery_picker(got, kind, mode):
             return
         self.busy = False
+        info("Import", "Gallery could not start.\n" + PICK_DBG, .4)
         self.go("import")  # fallback browser
 
-    def _picked(self, uris, album):
+    def _pick_failed(self, album, kind):
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+        lbl = Label(text="Nothing was selected.\n[" + PICK_DBG + "]", halign="center")
+        lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        box.add_widget(lbl)
+        pop = popup("Import", box, (.88, .42))
+        row = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(52))
+        row.add_widget(btn("Close", pop.dismiss, SOFT))
+        row.add_widget(btn("Try Files picker", lambda: (
+            pop.dismiss(), self.start_pick(album, kind, "document")), GREEN))
+        box.add_widget(row)
+        pop.open()
+
+    def _picked(self, uris, album, kind="photo"):
         self.last = time.time()
         if not uris or self.store.key is None:
             self.busy = False
+            if self.store.key is not None:
+                self._pick_failed(album, kind)
             return
         box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
         lbl = Label(text=f"{len(uris)} file(s) selected", halign="center", font_size=dp(16))
